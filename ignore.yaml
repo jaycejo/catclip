@@ -1,0 +1,23 @@
+ignore_dirs:
+  - .git
+  - .svn
+  - .hg
+  - node_modules
+  - target
+  - bin
+  - obj
+  - __pycache__
+  - .idea
+  - .vscode
+  - dist
+  - build
+  - out
+
+ignore_files:
+  - '*.class'
+  - '*.pyc'
+  - mvnw
+  - mvnw.cmd
+  - maven-wrapper.jar
+  - .DS_Store
+  - application.properties

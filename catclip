@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# ------------------------------------------------------------------------------
+# catclip — concat files (with “# File: <path>” headers) under each TARGET,
+# apply ignore-lists, copy to the clipboard, optionally print, and report which
+# dirs were used. Supports:
+#   --help, --no-ignore, --list-ignores, --print,
+#   --ignore [+pat -pat d+dir d-dir], lookup, and a final summary.
+# ------------------------------------------------------------------------------
+
+# 1) Prerequisite checks
+for cmd in pbcopy find realpath mktemp; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "Error: '$cmd' is required but not found in PATH." >&2
+    exit 1
+  fi
+done
+
+# 2) CONFIG: respect XDG_CONFIG_HOME, default to ~/.config
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/catclip"
+CONFIG="$CONFIG_DIR/ignore.yaml"
+
+# ensure config dir exists and is writable
+if ! mkdir -p "$CONFIG_DIR" 2>/dev/null; then
+  echo "Error: Cannot create or write to config dir '$CONFIG_DIR'." >&2
+  exit 1
+fi
+
+# 3) cleanup on exit
+TMPFILE=""
+DIRFILE=""
+cleanup() {
+  [[ -n "$TMPFILE" && -f "$TMPFILE" ]] && rm -f "$TMPFILE"
+  [[ -n "$DIRFILE" && -f "$DIRFILE" ]] && rm -f "$DIRFILE"
+}
+trap cleanup EXIT
+
+print_help() {
+  cat <<EOF
+Usage: catclip [OPTIONS] [TARGETS...]
+
+Concatenate files (with “# File: <path>” headers) under each TARGET
+(or "." if none), apply ignore-lists, copy to the clipboard,
+optionally print to stdout, and report which directories contributed files.
+
+Options:
+  --help, -h         Show this help and exit
+  --no-ignore        Do not apply ignore-lists (copy everything)
+  --list-ignores     Show current ignore-lists (from $CONFIG) and exit
+  --print            Also echo the concatenated output to stdout
+  --ignore EXPRESSION…
+                     Modify ignore lists in $CONFIG and exit. EXPRESSION can be:
+                       +pattern     (add file-pattern to ignore-files)
+                       -pattern     (remove file-pattern from ignore-files)
+                       d+dirname    (add dirname to ignore-dirs)
+                       d-dirname    (remove dirname from ignore-dirs)
+
+Targets:
+  One or more file or directory names. If a name isn’t found directly,
+  the script will search subdirectories (pruning ignore dirs unless
+  --no-ignore) and prompt if there are multiple matches.
+
+Examples:
+  catclip
+  catclip src docs --no-ignore
+  catclip --list-ignores
+  catclip --print
+  catclip --ignore +*.log -temp.txt
+  catclip --ignore d+node_modules d-target
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# 0) Parse flags
+# ------------------------------------------------------------------------------
+NO_IGNORE=false
+LIST_IGNORES=false
+SHOW_HELP=false
+PRINT_CONTENT=false
+IGNORE_OPS=()
+raw_inputs=()
+
+while (( $# )); do
+  case "$1" in
+    --no-ignore)    NO_IGNORE=true;       shift ;;
+    --list-ignores) LIST_IGNORES=true;    shift ;;
+    --print)        PRINT_CONTENT=true;   shift ;;
+    --help|-h)      SHOW_HELP=true;       shift ;;
+    --ignore)
+      shift
+      if (( $# == 0 )) || [[ ! $1 =~ ^d?[+-] ]]; then
+        echo "Error: '--ignore' requires +pat, -pat, d+dir, or d-dir." >&2
+        exit 1
+      fi
+      while (( $# )) && [[ $1 =~ ^d?[+-] ]]; do
+        IGNORE_OPS+=( "$1" )
+        shift
+      done
+      ;;
+    --)  shift; raw_inputs+=( "$@" ); break ;;
+    --*) echo "Error: Unknown option '$1'" >&2; exit 1 ;;
+    *)   raw_inputs+=( "$1" ); shift ;;
+  esac
+done
+
+[[ "$SHOW_HELP" == true ]] && { print_help; exit 0; }
+
+# ------------------------------------------------------------------------------
+# 1) Load ignore patterns from YAML
+# ------------------------------------------------------------------------------
+ignore_dirs=()
+ignore_files=()
+
+if [[ -r "$CONFIG" ]]; then
+  block=""
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in
+      ignore_dirs:*)   block="dirs"   ;;
+      ignore_files:*)  block="files"  ;;
+      -\ *) 
+        item="${line#- }"
+        if [[ "$block" == "dirs" ]]; then
+          ignore_dirs+=( "$item" )
+        elif [[ "$block" == "files" ]]; then
+          ignore_files+=( "$item" )
+        fi
+        ;;
+      *) block="" ;;
+    esac
+  done <"$CONFIG"
+fi
+
+# ------------------------------------------------------------------------------
+# 1.5) --ignore ops: apply, rewrite, exit
+# ------------------------------------------------------------------------------
+if (( ${#IGNORE_OPS[@]} > 0 )); then
+  echo "Updating ignore lists in $CONFIG:"
+  for op in "${IGNORE_OPS[@]}"; do
+    case "$op" in
+      d+*) dir_op=true;  action="+"; pat="${op:2}" ;;
+      d-*) dir_op=true;  action="-"; pat="${op:2}" ;;
+      +*)  dir_op=false; action="+"; pat="${op:1}" ;;
+      -*)  dir_op=false; action="-"; pat="${op:1}" ;;
+      *)   echo "  Skipping invalid: $op"; continue ;;
+    esac
+
+    if [[ "$action" == "-" ]]; then
+      if $dir_op; then
+        for i in "${!ignore_dirs[@]}"; do
+          [[ "${ignore_dirs[i]}" == "$pat" ]] && {
+            echo "  Removed ignore directory: $pat"
+            unset 'ignore_dirs[i]'
+          }
+        done
+      else
+        for i in "${!ignore_files[@]}"; do
+          [[ "${ignore_files[i]}" == "$pat" ]] && {
+            echo "  Removed ignore file: $pat"
+            unset 'ignore_files[i]'
+          }
+        done
+      fi
+    else
+      if $dir_op; then
+        echo "  Added ignore directory: $pat"
+        ignore_dirs+=( "$pat" )
+      else
+        echo "  Added ignore file: $pat"
+        ignore_files+=( "$pat" )
+      fi
+    fi
+  done
+
+  # write back
+  {
+    echo "ignore_dirs:"
+    for d in "${ignore_dirs[@]}";   do echo "  - $d"; done
+    echo
+    echo "ignore_files:"
+    for f in "${ignore_files[@]}";   do echo "  - $f"; done
+  } >"$CONFIG"
+
+  echo "Done."
+  exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# 2) --list-ignores
+# ------------------------------------------------------------------------------
+if [[ "$LIST_IGNORES" == true ]]; then
+  if [[ "$NO_IGNORE" == true ]]; then
+    echo "Ignore filtering is DISABLED (--no-ignore)."
+  else
+    echo "To modify ignores, run:"
+    echo "  catclip --ignore +pat -pat d+dir d-dir"
+    echo
+    echo "Ignored directories:"
+    printf "  - %s\n" "${ignore_dirs[@]:-<none>}"
+    echo
+    echo "Ignored files:"
+    printf "  - %s\n" "${ignore_files[@]:-<none>}"
+  fi
+  exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# 3) Default target to "."
+# ------------------------------------------------------------------------------
+(( ${#raw_inputs[@]} == 0 )) && raw_inputs=( "." )
+
+# ------------------------------------------------------------------------------
+# 4) Resolve targets
+# ------------------------------------------------------------------------------
+targets=()
+for arg in "${raw_inputs[@]}"; do
+  if [[ -e "$arg" ]]; then
+    targets+=( "$arg" ); continue
+  fi
+
+  found=()
+  if [[ "$NO_IGNORE" == false ]]; then
+    df_expr=()
+    for d in "${ignore_dirs[@]}"; do
+      df_expr+=( -path "*/$d" -prune -o )
+    done
+    df_expr+=( -type d -name "$arg" -print0 )
+    while IFS= read -r -d '' d; do found+=( "$d" ); done \
+      < <(find . "${df_expr[@]}" 2>/dev/null)
+  else
+    while IFS= read -r -d '' d; do found+=( "$d" ); done \
+      < <(find . -type d -name "$arg" -print0 2>/dev/null)
+  fi
+
+  case "${#found[@]}" in
+    0) echo "Warning: no file or dir named '$arg'" >&2 ;;
+    1) targets+=( "${found[0]}" ) ;;
+    *)  echo "Multiple matches for '$arg':"
+        for i in "${!found[@]}"; do
+          printf "  %2d) %s\n" $((i+1)) "${found[i]}"
+        done
+        read -rp "Choose [1-${#found[@]}]: " choice
+        if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || \
+           (( choice<1 || choice>${#found[@]} )); then
+          echo "Invalid; aborting." >&2
+          exit 1
+        fi
+        targets+=( "${found[choice-1]}" )
+        ;;
+  esac
+done
+
+(( ${#targets[@]} )) || { echo "No valid targets; aborting." >&2; exit 1; }
+
+# ------------------------------------------------------------------------------
+# 5) Build prune expression for files
+# ------------------------------------------------------------------------------
+prune_expr=()
+if [[ "$NO_IGNORE" == false ]]; then
+  for d in "${ignore_dirs[@]}"; do
+    prune_expr+=( -path "*/$d" -prune -o )
+  done
+fi
+prune_expr+=( -type f -print0 )
+
+# ------------------------------------------------------------------------------
+# 6) Gather content into temp files
+# ------------------------------------------------------------------------------
+TMPFILE="$(mktemp)"
+DIRFILE="$(mktemp)"
+for tgt in "${targets[@]}"; do
+  if [[ -f "$tgt" ]]; then
+    printf '%s\n' "$(dirname "$tgt")" >>"$DIRFILE"
+    {
+      echo "# File: $(realpath "$tgt")"; cat "$tgt"; echo
+    } >>"$TMPFILE"
+  else
+    find "$tgt" "${prune_expr[@]}" \
+      | while IFS= read -r -d '' file; do
+          b=$(basename "$file")
+          if [[ "$NO_IGNORE" == false ]]; then
+            for pat in "${ignore_files[@]}"; do
+              [[ $b == $pat ]] && continue 2
+            done
+          fi
+          printf '%s\n' "$(dirname "$file")" >>"$DIRFILE"
+          {
+            echo "# File: $(realpath "$file")"; cat "$file"; echo
+          } >>"$TMPFILE"
+        done
+  fi
+done
+
+# ---- New check: nothing collected? ----
+if [[ ! -s "$TMPFILE" ]]; then
+  echo "No files matched (clipboard left unchanged)."
+  echo "Hint: run 'catclip --list-ignores' to review your ignore-lists."
+  exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# 7) Copy to clipboard
+# ------------------------------------------------------------------------------
+cat "$TMPFILE" | pbcopy
+
+# ------------------------------------------------------------------------------
+# 8) Summary
+# ------------------------------------------------------------------------------
+echo "Copied contents from the following directories to clipboard:"
+sort -u "$DIRFILE" | while IFS= read -r d; do
+  echo "  • $d"
+done
+
+# ------------------------------------------------------------------------------
+# 9) Optional print
+# ------------------------------------------------------------------------------
+if [[ "$PRINT_CONTENT" == true ]]; then
+  echo; cat "$TMPFILE"
+fi
