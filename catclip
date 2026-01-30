@@ -1,80 +1,183 @@
 #!/usr/bin/env bash
+# ------------------------------------------------------------------------------
+# catclip - Context Gatherer for LLMs
+#
+# A robust tool to gather code context while respecting .gitignore rules.
+#
+# DESIGN PHILOSOPHY:
+# 1. Safety First: Don't leak secrets (.env) or junk (node_modules) by default.
+# 2. Native Dependencies: Use standard tools (awk, find, git) to avoid npm/pip deps.
+# 3. Git-Aware: Rely on 'git ls-files' as the source of truth when possible.
+# ------------------------------------------------------------------------------
+
+# SAFETY BOILERPLATE
+# set -e: Exit immediately if a command exits with a non-zero status.
+# set -u: Treat unset variables as an error (prevents accidental "rm -rf /" scenarios).
+# set -o pipefail: If any command in a pipeline fails, the whole pipe fails.
 set -euo pipefail
+
+# Internal Field Separator: Set to newline and tab only.
+# This ensures filenames with spaces are handled correctly.
 IFS=$'\n\t'
 
-# ------------------------------------------------------------------------------
-# catclip — concat files (with “# File: <path>” headers) under each TARGET,
-# apply ignore-lists, copy to the clipboard, optionally print, and report which
-# dirs were used. Supports:
-#   --help, --no-ignore, --list-ignores, --print,
-#   --ignore [+pat -pat d+dir d-dir], lookup, and a final summary.
-# ------------------------------------------------------------------------------
+# 0) TERMINAL CONFIGURATION
+# Force 256-color mode so output looks good even in restricted shells.
+export TERM="${TERM:-xterm-256color}"
 
-# 1) Prerequisite checks
-for cmd in pbcopy find realpath mktemp; do
+# 1) PREREQUISITE CHECKS
+# Fail fast if essential tools are missing.
+for cmd in pbcopy find mktemp awk stat git; do
   if ! command -v "$cmd" &>/dev/null; then
     echo "Error: '$cmd' is required but not found in PATH." >&2
     exit 1
   fi
 done
 
-# 2) CONFIG: respect XDG_CONFIG_HOME, default to ~/.config
+# 2) COLORS & THEME
+# We use ANSI escape codes. Variables make the code readable.
+RESET=$'\033[0m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+RED=$'\033[31m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+BLUE=$'\033[34m'
+MAGENTA=$'\033[35m'
+CYAN=$'\033[36m'
+
+# Semantic Variables allow us to change the theme easily in one place.
+CLR_SUCCESS=$'\033[32m'
+CLR_ERROR=$'\033[31m'
+CLR_WARN=$'\033[33m'
+CLR_DIR=$'\033[1;34m'
+CLR_LABEL=$'\033[90m'
+CLR_VALUE=$'\033[1m'
+CLR_TREE=$'\033[90m'
+CLR_PROMPT=$'\033[36m'
+CLR_GIT=$'\033[35m' 
+
+# 3) CONFIGURATION MANAGEMENT
+# Adhere to XDG Base Directory specification ($HOME/.config).
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/catclip"
 CONFIG="$CONFIG_DIR/ignore.yaml"
 
-# ensure config dir exists and is writable
-if ! mkdir -p "$CONFIG_DIR" 2>/dev/null; then
-  echo "Error: Cannot create or write to config dir '$CONFIG_DIR'." >&2
-  exit 1
+# Auto-initialize config if it doesn't exist to prevent "file not found" errors.
+if [[ ! -f "$CONFIG" ]]; then
+  mkdir -p "$CONFIG_DIR"
+  touch "$CONFIG"
 fi
 
-# 3) cleanup on exit
+# 4) CLEANUP TRAPS
+# Use 'mktemp' for atomic temporary files.
+# The 'trap' ensures files are deleted even if the user Ctrl+C's the script.
 TMPFILE=""
-DIRFILE=""
+LISTFILE=""
 cleanup() {
   [[ -n "$TMPFILE" && -f "$TMPFILE" ]] && rm -f "$TMPFILE"
-  [[ -n "$DIRFILE" && -f "$DIRFILE" ]] && rm -f "$DIRFILE"
+  [[ -n "$LISTFILE" && -f "$LISTFILE" ]] && rm -f "$LISTFILE"
 }
 trap cleanup EXIT
 
+# 5) HELPER FUNCTIONS
+
+# format_size: Converts bytes to human-readable (KB, MB) using awk.
+# We use awk because bash does not support floating point math natively.
+format_size() {
+  awk -v b="$1" 'BEGIN {
+    split("B KB MB GB TB", units);
+    u=1;
+    while(b >= 1024 && u < 5) { b/=1024; u++ }
+    printf "%.2f%s", b, units[u]
+  }'
+}
+
+# print_tree: Generates a visual tree structure from a flat list of paths.
+# This logic parses path strings (e.g., "src/components/Button.tsx") and
+# draws the corresponding ASCII indentation.
+print_tree() {
+  local list_file="$1"
+  sort "$list_file" | awk -v dir_col="$CLR_DIR" -v reset="$RESET" -v tree_col="$CLR_TREE" -F/ '
+  {
+    for (i=1; i<NF; i++) {
+      if ($i != last[i]) {
+        for (j=1; j<i; j++) printf tree_col "│   " reset
+        if (i == 1) printf "" 
+        else printf tree_col "├── " reset
+        print dir_col $i "/" reset
+        last[i] = $i
+        for (k=i+1; k<=20; k++) delete last[k]
+      }
+    }
+    for (j=1; j<NF; j++) printf tree_col "│   " reset
+    printf tree_col "├── " reset
+    print $NF
+    delete last[NF]
+  }'
+}
+
 print_help() {
   cat <<EOF
-Usage: catclip [OPTIONS] [TARGETS...]
+${BOLD}catclip${RESET} - Context Gatherer for LLMs
 
-Concatenate files (with “# File: <path>” headers) under each TARGET
-(or "." if none), apply ignore-lists, copy to the clipboard,
-optionally print to stdout, and report which directories contributed files.
+  A developer tool to concatenate code files into the clipboard for AI prompts.
+  It automatically respects ${BOLD}.gitignore${RESET} and your local ${BOLD}ignore.yaml${RESET} config.
 
-Options:
-  --help, -h         Show this help and exit
-  --no-ignore        Do not apply ignore-lists (copy everything)
-  --list-ignores     Show current ignore-lists (from $CONFIG) and exit
-  --print            Also echo the concatenated output to stdout
-  --ignore EXPRESSION…
-                     Modify ignore lists in $CONFIG and exit. EXPRESSION can be:
-                       +pattern     (add file-pattern to ignore-files)
-                       -pattern     (remove file-pattern from ignore-files)
-                       d+dirname    (add dirname to ignore-dirs)
-                       d-dirname    (remove dirname from ignore-dirs)
+${BOLD}Usage:${RESET}
+  catclip [OPTIONS] [TARGETS...]
 
-Targets:
-  One or more file or directory names. If a name isn’t found directly,
-  the script will search subdirectories (pruning ignore dirs unless
-  --no-ignore) and prompt if there are multiple matches.
+${BOLD}Targets:${RESET}
+  One or more directories or files. Defaults to current directory (.) if empty.
 
-Examples:
-  catclip
-  catclip src docs --no-ignore
-  catclip --list-ignores
-  catclip --print
-  catclip --ignore +*.log -temp.txt
-  catclip --ignore d+node_modules d-target
+${BOLD}Options:${RESET}
+  ${GREEN}--help, -h${RESET}
+      Show this help message.
+
+  ${GREEN}--no-ignore${RESET}
+      ${BOLD}DANGER ZONE:${RESET} Disables ALL filters (.gitignore and ignore.yaml).
+      Copies everything found. Useful if you specifically need to copy
+      ignored files (like .env.example or build configs), but can hang
+      if run on large directories like node_modules.
+
+  ${GREEN}--yes, -y${RESET}
+      Skip the interactive confirmation prompt, even if the token count
+      is high. Useful for scripting or trusted directories.
+
+  ${GREEN}--print${RESET}
+      Output the full concatenated text to the terminal (stdout) in addition
+      to copying to the clipboard. Useful for piping to files:
+      ${DIM}catclip --print > full_context.txt${RESET}
+
+  ${GREEN}--list-ignores${RESET}
+      Print the current effective ignore rules. Shows which rules come
+      from your global config vs the project's .gitignore.
+
+  ${GREEN}--ignore [OPS]${RESET}
+      Quickly modify your permanent ${DIM}$CONFIG${RESET}
+      ${BOLD}Syntax:${RESET}
+        ${CYAN}+ext${RESET}     Ignore a file pattern (e.g. +*.log)
+        ${CYAN}-ext${RESET}     Stop ignoring a pattern (e.g. -*.log)
+        ${CYAN}d+dir${RESET}    Ignore a directory (e.g. d+dist)
+        ${CYAN}d-dir${RESET}    Stop ignoring a directory (e.g. d-dist)
+
+${BOLD}Examples:${RESET}
+  ${DIM}# Copying directories and files${RESET}
+  ${GREEN}catclip${RESET} src                                 # Copy a directory
+  ${GREEN}catclip${RESET} README.md src/App.tsx package.json  # Copy specific files
+
+  ${DIM}# Advanced${RESET}
+  ${GREEN}catclip${RESET} --no-ignore .env.example   # Force copy an ignored file
+  ${GREEN}catclip${RESET} --ignore +*.log d+tmp      # Ignore .log files AND 'tmp' folder
+
+${BOLD}Config Location:${RESET}
+  ${DIM}$CONFIG${RESET}
 EOF
 }
 
 # ------------------------------------------------------------------------------
-# 0) Parse flags
+# 6) FLAG PARSING
 # ------------------------------------------------------------------------------
+# Default states
+SKIP_CONFIRM=false
 NO_IGNORE=false
 LIST_IGNORES=false
 SHOW_HELP=false
@@ -82,25 +185,22 @@ PRINT_CONTENT=false
 IGNORE_OPS=()
 raw_inputs=()
 
+# Process arguments
 while (( $# )); do
   case "$1" in
+    --yes|-y)       SKIP_CONFIRM=true;    shift ;;
     --no-ignore)    NO_IGNORE=true;       shift ;;
     --list-ignores) LIST_IGNORES=true;    shift ;;
     --print)        PRINT_CONTENT=true;   shift ;;
     --help|-h)      SHOW_HELP=true;       shift ;;
     --ignore)
       shift
-      if (( $# == 0 )) || [[ ! $1 =~ ^d?[+-] ]]; then
-        echo "Error: '--ignore' requires +pat, -pat, d+dir, or d-dir." >&2
-        exit 1
-      fi
-      while (( $# )) && [[ $1 =~ ^d?[+-] ]]; do
-        IGNORE_OPS+=( "$1" )
-        shift
-      done
+      # Syntax check for ignore operations (must start with +, -, d+, d-)
+      [[ $# -eq 0 || ! $1 =~ ^d?[+-] ]] && { printf "%s\n" "${CLR_ERROR}Error: invalid --ignore format.${RESET}" >&2; exit 1; }
+      while (( $# )) && [[ $1 =~ ^d?[+-] ]]; do IGNORE_OPS+=( "$1" ); shift; done
       ;;
-    --)  shift; raw_inputs+=( "$@" ); break ;;
-    --*) echo "Error: Unknown option '$1'" >&2; exit 1 ;;
+    --) shift; raw_inputs+=( "$@" ); break ;;
+    --*) printf "%s\n" "${CLR_ERROR}Error: Unknown option '$1'${RESET}" >&2; exit 1 ;;
     *)   raw_inputs+=( "$1" ); shift ;;
   esac
 done
@@ -108,25 +208,27 @@ done
 [[ "$SHOW_HELP" == true ]] && { print_help; exit 0; }
 
 # ------------------------------------------------------------------------------
-# 1) Load ignore patterns from YAML
+# 7) LOAD IGNORES (YAML PARSING)
 # ------------------------------------------------------------------------------
+# We manually parse the simple YAML format to avoid requiring 'yq' dependency.
 ignore_dirs=()
 ignore_files=()
 
 if [[ -r "$CONFIG" ]]; then
   block=""
   while IFS= read -r line; do
+    # Trim leading whitespace
     line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" ]] && continue
     case "$line" in
       ignore_dirs:*)   block="dirs"   ;;
       ignore_files:*)  block="files"  ;;
       -\ *) 
+        # Clean quotes and list bullets
         item="${line#- }"
-        if [[ "$block" == "dirs" ]]; then
-          ignore_dirs+=( "$item" )
-        elif [[ "$block" == "files" ]]; then
-          ignore_files+=( "$item" )
-        fi
+        item="${item%\"}"; item="${item#\"}"; item="${item%\'}"; item="${item#\'}"
+        if [[ "$block" == "dirs" ]]; then ignore_dirs+=( "$item" ); fi
+        if [[ "$block" == "files" ]]; then ignore_files+=( "$item" ); fi
         ;;
       *) block="" ;;
     esac
@@ -134,188 +236,306 @@ if [[ -r "$CONFIG" ]]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 1.5) --ignore ops: apply, rewrite, exit
+# 8) CONFIG UPDATE LOGIC (--ignore)
 # ------------------------------------------------------------------------------
 if (( ${#IGNORE_OPS[@]} > 0 )); then
-  echo "Updating ignore lists in $CONFIG:"
+  printf "%s\n" "${BOLD}Updating ignore list in ${DIM}$CONFIG${RESET}"
+  changes_log=()
+
   for op in "${IGNORE_OPS[@]}"; do
     case "$op" in
-      d+*) dir_op=true;  action="+"; pat="${op:2}" ;;
-      d-*) dir_op=true;  action="-"; pat="${op:2}" ;;
-      +*)  dir_op=false; action="+"; pat="${op:1}" ;;
-      -*)  dir_op=false; action="-"; pat="${op:1}" ;;
-      *)   echo "  Skipping invalid: $op"; continue ;;
+      d+*) # Add Dir
+           ignore_dirs+=( "${op:2}" )
+           changes_log+=( "${GREEN}+${RESET} ${CLR_DIR}${op:2}${RESET}" )
+           ;;
+      d-*) # Remove Dir (Filter array)
+           new_dirs=()
+           for d in "${ignore_dirs[@]}"; do [[ "$d" != "${op:2}" ]] && new_dirs+=("$d"); done
+           ignore_dirs=("${new_dirs[@]}")
+           changes_log+=( "${RED}-${RESET} ${CLR_DIR}${op:2}${RESET}" )
+           ;;
+      +*)  # Add File
+           ignore_files+=( "${op:1}" )
+           changes_log+=( "${GREEN}+${RESET} ${op:1}" ) 
+           ;;
+      -*)  # Remove File
+           new_files=()
+           for f in "${ignore_files[@]}"; do [[ "$f" != "${op:1}" ]] && new_files+=("$f"); done
+           ignore_files=("${new_files[@]}")
+           changes_log+=( "${RED}-${RESET} ${op:1}" )
+           ;;
     esac
-
-    if [[ "$action" == "-" ]]; then
-      if $dir_op; then
-        for i in "${!ignore_dirs[@]}"; do
-          [[ "${ignore_dirs[i]}" == "$pat" ]] && {
-            echo "  Removed ignore directory: $pat"
-            unset 'ignore_dirs[i]'
-          }
-        done
-      else
-        for i in "${!ignore_files[@]}"; do
-          [[ "${ignore_files[i]}" == "$pat" ]] && {
-            echo "  Removed ignore file: $pat"
-            unset 'ignore_files[i]'
-          }
-        done
-      fi
-    else
-      if $dir_op; then
-        echo "  Added ignore directory: $pat"
-        ignore_dirs+=( "$pat" )
-      else
-        echo "  Added ignore file: $pat"
-        ignore_files+=( "$pat" )
-      fi
-    fi
   done
 
-  # write back
+  # Rewrite Config File
   {
     echo "ignore_dirs:"
-    for d in "${ignore_dirs[@]}";   do echo "  - $d"; done
-    echo
+    for d in "${ignore_dirs[@]}"; do echo "  - $d"; done
     echo "ignore_files:"
-    for f in "${ignore_files[@]}";   do echo "  - $f"; done
+    for f in "${ignore_files[@]}"; do echo "  - \"$f\""; done
   } >"$CONFIG"
 
-  echo "Done."
+  # Display Status
+  printf "\n${BOLD}New Configuration:${RESET}\n"
+  printf "\n${BOLD}Ignored Directories (YAML):${RESET}\n"
+  for d in "${ignore_dirs[@]}"; do printf "  ${CLR_ERROR}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d"; done
+  printf "\n${BOLD}Ignored Files (YAML):${RESET}\n"
+  for f in "${ignore_files[@]}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f"; done
+
+  printf "\n${BOLD}Changes applied:${RESET}\n"
+  for change in "${changes_log[@]}"; do printf "  %s\n" "$change"; done
+
+  # Disclaimer regarding Git logic
+  if git rev-parse --show-toplevel &>/dev/null; then
+    printf "\n${CLR_GIT}Note: Files listed in .gitignore remain excluded automatically.${RESET}\n"
+  else
+    printf "\n${DIM}Note: If used inside a Git project, .gitignore rules will also apply.${RESET}\n"
+  fi
   exit 0
 fi
 
 # ------------------------------------------------------------------------------
-# 2) --list-ignores
+# 9) LIST IGNORES COMMAND
 # ------------------------------------------------------------------------------
 if [[ "$LIST_IGNORES" == true ]]; then
-  if [[ "$NO_IGNORE" == true ]]; then
-    echo "Ignore filtering is DISABLED (--no-ignore)."
-  else
-    echo "To modify ignores, run:"
-    echo "  catclip --ignore +pat -pat d+dir d-dir"
-    echo
-    echo "Ignored directories:"
-    printf "  - %s\n" "${ignore_dirs[@]:-<none>}"
-    echo
-    echo "Ignored files:"
-    printf "  - %s\n" "${ignore_files[@]:-<none>}"
+  printf "%s\n" "${BOLD}Current Configuration${RESET}"
+  printf "${DIM}%s${RESET}\n" "$CONFIG"
+  
+  printf "\n${BOLD}Ignored Directories (YAML):${RESET}\n"
+  for d in "${ignore_dirs[@]}"; do printf "  ${CLR_ERROR}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d"; done
+  
+  printf "\n${BOLD}Ignored Files (YAML):${RESET}\n"
+  for f in "${ignore_files[@]}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f"; done
+
+  # Also show .gitignore if we are in a repo, so user sees full context
+  if git rev-parse --show-toplevel &>/dev/null; then
+    git_root=$(git rev-parse --show-toplevel)
+    git_ignore_file="$git_root/.gitignore"
+    if [[ -f "$git_ignore_file" ]]; then
+      printf "\n${BOLD}Ignored Files (Project .gitignore):${RESET}\n"
+      printf "${DIM}%s${RESET}\n" "$git_ignore_file"
+      grep -vE '^\s*#|^\s*$' "$git_ignore_file" | while read -r line; do
+        printf "  ${CLR_GIT}•${RESET} %s\n" "$line"
+      done
+    else
+      printf "\n${DIM}(No .gitignore found in project root)${RESET}\n"
+    fi
   fi
   exit 0
 fi
 
 # ------------------------------------------------------------------------------
-# 3) Default target to "."
+# 10) TARGET RESOLUTION (SMART SEARCH)
 # ------------------------------------------------------------------------------
+# If no args, default to current directory "."
 (( ${#raw_inputs[@]} == 0 )) && raw_inputs=( "." )
-
-# ------------------------------------------------------------------------------
-# 4) Resolve targets
-# ------------------------------------------------------------------------------
 targets=()
+
+# Detect Git Root Early
+IS_GIT=false
+if git rev-parse --show-toplevel &>/dev/null; then IS_GIT=true; fi
+
+# Fuzzy Matching Logic
 for arg in "${raw_inputs[@]}"; do
   if [[ -e "$arg" ]]; then
-    targets+=( "$arg" ); continue
-  fi
-
-  found=()
-  if [[ "$NO_IGNORE" == false ]]; then
-    df_expr=()
-    for d in "${ignore_dirs[@]}"; do
-      df_expr+=( -path "*/$d" -prune -o )
-    done
-    df_expr+=( -type d -name "$arg" -print0 )
-    while IFS= read -r -d '' d; do found+=( "$d" ); done \
-      < <(find . "${df_expr[@]}" 2>/dev/null)
+    # Exact match found
+    targets+=( "$arg" )
   else
-    while IFS= read -r -d '' d; do found+=( "$d" ); done \
-      < <(find . -type d -name "$arg" -print0 2>/dev/null)
-  fi
+    # Fuzzy Search: Try finding directory by name
+    
+    # 1. Build PRUNE options from YAML (optimization for 'find')
+    search_prune_opts=()
+    if [[ "$NO_IGNORE" == false ]]; then
+      for d in "${ignore_dirs[@]}"; do search_prune_opts+=( -name "$d" -prune -o ); done
+    fi
 
-  case "${#found[@]}" in
-    0) echo "Warning: no file or dir named '$arg'" >&2 ;;
-    1) targets+=( "${found[0]}" ) ;;
-    *)  echo "Multiple matches for '$arg':"
-        for i in "${!found[@]}"; do
-          printf "  %2d) %s\n" $((i+1)) "${found[i]}"
-        done
-        read -rp "Choose [1-${#found[@]}]: " choice
-        if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || \
-           (( choice<1 || choice>${#found[@]} )); then
-          echo "Invalid; aborting." >&2
-          exit 1
+    found=()
+    # 2. Run 'find' with pruning enabled
+    while IFS= read -r -d '' d; do 
+        # 3. Post-Filter: Check against .gitignore (if in a repo)
+        if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]]; then
+            # If 'git check-ignore' returns 0, the path IS ignored -> skip it.
+            if git check-ignore -q "$d"; then continue; fi
         fi
-        targets+=( "${found[choice-1]}" )
-        ;;
-  esac
+        found+=( "$d" )
+    done < <(find . "${search_prune_opts[@]}" -type d -name "$arg" -not -path '*/.*' -print0 2>/dev/null)
+    
+    if (( ${#found[@]} == 0 )); then
+      printf "%s\n" "${CLR_WARN}Warning: '$arg' not found.${RESET}" >&2
+    elif (( ${#found[@]} == 1 )); then
+      targets+=( "${found[0]}" )
+    else
+      # Prompt user if multiple folders match
+      printf "%s\n" "${BOLD}Multiple matches for '$arg':${RESET}"
+      for i in "${!found[@]}"; do printf "  ${BOLD}%2d)${RESET} ${CLR_DIR}%s${RESET}\n" $((i+1)) "${found[i]}"; done
+      read -rp "Choose [1-${#found[@]}]: " c
+      targets+=( "${found[c-1]}" )
+    fi
+  fi
 done
 
-(( ${#targets[@]} )) || { echo "No valid targets; aborting." >&2; exit 1; }
+(( ${#targets[@]} == 0 )) && exit 1
 
 # ------------------------------------------------------------------------------
-# 5) Build prune expression for files
+# 11) BUILD FALLBACK COMMANDS
 # ------------------------------------------------------------------------------
-prune_expr=()
+# If not using git, we rely on 'find'. We pre-build the exclusion args here.
+find_opts=()
 if [[ "$NO_IGNORE" == false ]]; then
-  for d in "${ignore_dirs[@]}"; do
-    prune_expr+=( -path "*/$d" -prune -o )
+  for d in "${ignore_dirs[@]}"; do find_opts+=( -name "$d" -prune -o ); done
+fi
+find_opts+=( -type f )
+find_opts+=( -print0 )
+
+# ------------------------------------------------------------------------------
+# 12) PHASE 1: DISCOVERY (HYBRID STRATEGY)
+# ------------------------------------------------------------------------------
+# This is the core logic.
+# Strategy:
+# 1. If inside a Git Repo: Use 'git ls-files'. It is faster and automatically
+#    respects .gitignore (which is usually what we want).
+# 2. Else: Use 'find'. We manually filter out global ignores.
+
+LISTFILE="$(mktemp)"
+count=0
+
+if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]]; then
+  # --- GIT MODE ---
+  # We use Process Substitution: < <(...)
+  # WHY: If we used a standard pipe `git ... | while`, the loop would run in a Subshell.
+  # Variables updated inside (like 'count') would disappear when the loop finishes.
+  # Process substitution keeps the loop in the main shell scope.
+  for tgt in "${targets[@]}"; do
+    while IFS= read -r f; do
+       # Apply additional YAML file-ignores (Git doesn't know about our local config)
+       filename=$(basename "$f")
+       skip=false
+       for pat in "${ignore_files[@]}"; do
+         if [[ "$filename" == $pat ]]; then skip=true; break; fi
+       done
+       [[ "$skip" == true ]] && continue
+       
+       # Binary file check: grep -I searches for binary chars.
+       # We don't want to copy images or compiled binaries to the clipboard.
+       [[ -f "$f" ]] || continue
+       if ! grep -Iq . "$f" 2>/dev/null && [[ -s "$f" ]]; then continue; fi
+       
+       echo "$f" >> "$LISTFILE"
+       ((count++))
+    done < <(git ls-files --cached --others --exclude-standard "$tgt")
+  done
+else
+  # --- FALLBACK MODE (FIND) ---
+  for tgt in "${targets[@]}"; do
+    if [[ -f "$tgt" ]]; then
+      files_to_process=( "$tgt" )
+    else
+      files_to_process=()
+      while IFS= read -r -d '' f; do files_to_process+=( "$f" ); done < <(find "$tgt" "${find_opts[@]}")
+    fi
+
+    for f in "${files_to_process[@]}"; do
+      # Manual file-ignore check
+      if [[ "$NO_IGNORE" == false ]]; then
+        filename=$(basename "$f")
+        skip=false
+        for pat in "${ignore_files[@]}"; do
+           if [[ "$filename" == $pat ]]; then skip=true; break; fi
+        done
+        [[ "$skip" == true ]] && continue
+      fi
+      # Binary check
+      if ! grep -Iq . "$f" 2>/dev/null && [[ -s "$f" ]]; then continue; fi
+      
+      echo "${f#./}" >> "$LISTFILE"
+      ((count++))
+    done
   done
 fi
-prune_expr+=( -type f -print0 )
 
-# ------------------------------------------------------------------------------
-# 6) Gather content into temp files
-# ------------------------------------------------------------------------------
-TMPFILE="$(mktemp)"
-DIRFILE="$(mktemp)"
-for tgt in "${targets[@]}"; do
-  if [[ -f "$tgt" ]]; then
-    printf '%s\n' "$(dirname "$tgt")" >>"$DIRFILE"
-    {
-      echo "# File: $(realpath "$tgt")"; cat "$tgt"; echo
-    } >>"$TMPFILE"
-  else
-    find "$tgt" "${prune_expr[@]}" \
-      | while IFS= read -r -d '' file; do
-          b=$(basename "$file")
-          if [[ "$NO_IGNORE" == false ]]; then
-            for pat in "${ignore_files[@]}"; do
-              [[ $b == $pat ]] && continue 2
-            done
-          fi
-          printf '%s\n' "$(dirname "$file")" >>"$DIRFILE"
-          {
-            echo "# File: $(realpath "$file")"; cat "$file"; echo
-          } >>"$TMPFILE"
-        done
-  fi
-done
-
-# ---- New check: nothing collected? ----
-if [[ ! -s "$TMPFILE" ]]; then
-  echo "No files matched (clipboard left unchanged)."
-  echo "Hint: run 'catclip --list-ignores' to review your ignore-lists."
+if [[ ! -s "$LISTFILE" ]]; then
+  printf "%s\n" "${CLR_WARN}No text files found.${RESET}"
   exit 1
 fi
 
 # ------------------------------------------------------------------------------
-# 7) Copy to clipboard
+# 13) PHASE 2: PREVIEW & ANALYSIS
 # ------------------------------------------------------------------------------
-cat "$TMPFILE" | pbcopy
+# We calculate total size and estimate tokens BEFORE copying.
+# WHY: This acts as a "Safety Brake". Pasting 500MB into an LLM will crash the browser.
+
+# Size Calculation:
+# 'stat -f %z' gets exact byte size. Much more accurate than 'du' for small files.
+total_bytes=$(tr '\n' '\0' < "$LISTFILE" | xargs -0 stat -f %z | awk '{s+=$1} END {print s}')
+total_bytes=$((total_bytes + (count * 30))) # Add overhead for our injected headers
+
+human_size=$(format_size "$total_bytes")
+
+# Token Estimation:
+# Rule of thumb: 1 token is approx 4 characters (bytes).
+est_tokens=$((total_bytes / 4))
+TOKEN_WARN_LIMIT=32000
+
+printf "\n${BOLD}Files to Copy:${RESET}\n"
+
+# Inform user which strategy was used
+if [[ "$NO_IGNORE" == true ]]; then
+  printf "  ${CLR_WARN}⚠️  Filters DISABLED (--no-ignore)${RESET}\n"
+elif [[ "$IS_GIT" == true ]]; then
+  printf "  ${CLR_GIT}Excluding files in .gitignore and %s${RESET}\n" "$CONFIG"
+else
+  printf "  ${CLR_WARN}No .gitignore found, excluding files in %s${RESET}\n" "$CONFIG"
+fi
+
+print_tree "$LISTFILE"
+printf "\n"
+
+# Warn if exceeding standard LLM context windows (32k is a safe common limit)
+if (( est_tokens > TOKEN_WARN_LIMIT )); then
+  printf "  ${CLR_WARN}⚠️  Warning: ~%d tokens. This may exceed the context window of some LLMs.%s\n" "$est_tokens" "${RESET}"
+fi
+
+printf "  ${CLR_LABEL}%-8s${RESET} ${CLR_VALUE}%d files${RESET}\n" "Count:" "$count"
+printf "  ${CLR_LABEL}%-8s${RESET} ${CLR_VALUE}%s${RESET}\n" "Size:" "$human_size"
+printf "  ${CLR_LABEL}%-8s${RESET} ${CLR_VALUE}~%d${RESET}\n" "Tokens:" "$est_tokens"
+
+# 14) AUTO-CONFIRMATION LOGIC
+# We interrupt the flow ONLY if:
+# 1. The token count is dangerous.
+# 2. The user did not explicitly allow it with -y.
+if [[ "$SKIP_CONFIRM" == false && $est_tokens -gt $TOKEN_WARN_LIMIT ]]; then
+  printf "\n${CLR_PROMPT}Proceed with copy? [y/N] ${RESET}"
+  read -r -n 1 response
+  echo 
+  if [[ ! "$response" =~ ^[Yy]$ ]]; then
+    printf "${CLR_WARN}Aborted.${RESET}\n"
+    exit 0
+  fi
+fi
 
 # ------------------------------------------------------------------------------
-# 8) Summary
+# 15) PHASE 3: EXECUTION (COPY)
 # ------------------------------------------------------------------------------
-echo "Copied contents from the following directories to clipboard:"
-sort -u "$DIRFILE" | while IFS= read -r d; do
-  echo "  • $d"
-done
+TMPFILE="$(mktemp)"
 
-# ------------------------------------------------------------------------------
-# 9) Optional print
-# ------------------------------------------------------------------------------
+# Read files and append headers
+# We inject "# File: path/to/file" so the LLM knows where the code comes from.
+while IFS= read -r rel_path; do
+  f="./$rel_path"
+  if [[ -f "$f" ]]; then
+    { echo "# File: $rel_path"; cat "$f"; echo ""; } >> "$TMPFILE"
+  fi
+done < "$LISTFILE"
+
+# Send to MacOS Clipboard
+pbcopy < "$TMPFILE"
+
+printf "\n${CLR_SUCCESS}✔${RESET} ${BOLD}Copied to clipboard!${RESET}\n"
+
+# Optional: Print to stdout (for piping to files)
 if [[ "$PRINT_CONTENT" == true ]]; then
-  echo; cat "$TMPFILE"
+  printf "\n%s\n" "${CLR_TREE}--- Content Start ---${RESET}"
+  awk -v color="${MAGENTA}" -v reset="${RESET}" \
+    '/^# File:/ { print color $0 reset; next } { print }' "$TMPFILE"
+  printf "%s\n" "${CLR_TREE}--- Content End ---${RESET}"
 fi
