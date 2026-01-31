@@ -1,23 +1,102 @@
 ignore_dirs:
+  # Version Control
   - .git
   - .svn
   - .hg
-  - node_modules
-  - target
-  - bin
-  - obj
-  - __pycache__
+  
+  # IDEs & Editors
   - .idea
   - .vscode
-  - dist
+  - .cursor
+  - .history
+  
+  # JavaScript / Node
+  - node_modules
+  - bower_components
+  - jspm_packages
+  - coverage
+  - .npm
+  - .yarn
+  - .pnpm-store
+  
+  # Python
+  - __pycache__
+  - venv
+  - .venv
+  - env
+  - .pytest_cache
+  - .mypy_cache
+  - .tox
+  - htmlcov
+  
+  # Java / Build
+  - target
   - build
+  - dist
   - out
+  - bin
+  - obj
+  - .gradle
+  
+  # Web Frameworks
+  - .next
+  - .nuxt
+  - .serverless
+  - .turbo
 
 ignore_files:
-  - '*.class'
-  - '*.pyc'
-  - mvnw
-  - mvnw.cmd
-  - maven-wrapper.jar
+  # System
   - .DS_Store
+  - .AppleDouble
+  - .LSOverride
+
+  # Binaries & Archives
+  - "*.class"
+  - "*.pyc"
+  - "*.pyo"
+  - "*.exe"
+  - "*.dll"
+  - "*.so"
+  - "*.dylib"
+  - "*.jar"
+  - "*.war"
+  - "*.zip"
+  - "*.tar.gz"
+  - "*.db"
+  - "*.sqlite"
+  
+  # Media
+  - "*.png"
+  - "*.jpg"
+  - "*.jpeg"
+  - "*.gif"
+  - "*.ico"
+  - "*.svg"
+  - "*.pdf"
+  - "*.mov"
+  - "*.mp4"
+  - "*.webm"
+
+  # Lockfiles
+  - package-lock.json
+  - yarn.lock
+  - pnpm-lock.yaml
+  - poetry.lock
+  - Pipfile.lock
+  - bun.lockb
+  
+  # Secrets (CRITICAL)
+  - .env
+  - .env.local
+  - .env.*
+  - "*.pem"
+  - "*.key"
+  - id_rsa
   - application.properties
+  - application.yml
+
+  # Logs
+  - "*.log"
+  - "*.tmp"
+  - "*.bak"
+  - "*.swp"

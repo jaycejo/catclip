@@ -8,6 +8,7 @@
 # 1. Safety First: Don't leak secrets (.env) or junk (node_modules) by default.
 # 2. Native Dependencies: Use standard tools (awk, find, git) to avoid npm/pip deps.
 # 3. Git-Aware: Rely on 'git ls-files' as the source of truth when possible.
+# 4. Self-Healing: Contains embedded defaults to restore config if missing/broken.
 # ------------------------------------------------------------------------------
 
 # SAFETY BOILERPLATE
@@ -61,10 +62,118 @@ CLR_GIT=$'\033[35m'
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/catclip"
 CONFIG="$CONFIG_DIR/ignore.yaml"
 
-# Auto-initialize config if it doesn't exist to prevent "file not found" errors.
+# EMBEDDED DEFAULTS (The "Factory Reset" State)
+get_default_config() {
+  cat <<EOF
+ignore_dirs:
+  # Version Control
+  - .git
+  - .svn
+  - .hg
+  
+  # IDEs & Editors
+  - .idea
+  - .vscode
+  - .cursor
+  - .history
+  
+  # JavaScript / Node
+  - node_modules
+  - bower_components
+  - jspm_packages
+  - coverage
+  - .npm
+  - .yarn
+  - .pnpm-store
+  
+  # Python
+  - __pycache__
+  - venv
+  - .venv
+  - env
+  - .pytest_cache
+  - .mypy_cache
+  - .tox
+  - htmlcov
+  
+  # Java / Build
+  - target
+  - build
+  - dist
+  - out
+  - bin
+  - obj
+  - .gradle
+  
+  # Web Frameworks
+  - .next
+  - .nuxt
+  - .serverless
+  - .turbo
+
+ignore_files:
+  # System
+  - .DS_Store
+  - .AppleDouble
+  - .LSOverride
+
+  # Binaries & Archives
+  - "*.class"
+  - "*.pyc"
+  - "*.pyo"
+  - "*.exe"
+  - "*.dll"
+  - "*.so"
+  - "*.dylib"
+  - "*.jar"
+  - "*.war"
+  - "*.zip"
+  - "*.tar.gz"
+  - "*.db"
+  - "*.sqlite"
+  
+  # Media
+  - "*.png"
+  - "*.jpg"
+  - "*.jpeg"
+  - "*.gif"
+  - "*.ico"
+  - "*.svg"
+  - "*.pdf"
+  - "*.mov"
+  - "*.mp4"
+  - "*.webm"
+
+  # Lockfiles
+  - package-lock.json
+  - yarn.lock
+  - pnpm-lock.yaml
+  - poetry.lock
+  - Pipfile.lock
+  - bun.lockb
+  
+  # Secrets (CRITICAL)
+  - .env
+  - .env.local
+  - .env.*
+  - "*.pem"
+  - "*.key"
+  - id_rsa
+  - application.properties
+  - application.yml
+
+  # Logs
+  - "*.log"
+  - "*.tmp"
+  - "*.bak"
+  - "*.swp"
+EOF
+}
+
+# Auto-Create if missing
 if [[ ! -f "$CONFIG" ]]; then
   mkdir -p "$CONFIG_DIR"
-  touch "$CONFIG"
+  get_default_config > "$CONFIG"
 fi
 
 # 4) CLEANUP TRAPS
@@ -158,6 +267,9 @@ ${BOLD}Options:${RESET}
         ${CYAN}-ext${RESET}     Stop ignoring a pattern (e.g. -*.log)
         ${CYAN}d+dir${RESET}    Ignore a directory (e.g. d+dist)
         ${CYAN}d-dir${RESET}    Stop ignoring a directory (e.g. d-dist)
+  
+  ${GREEN}--reset-config${RESET}
+      Restore the configuration file to factory defaults.
 
 ${BOLD}Examples:${RESET}
   ${DIM}# Copying directories and files${RESET}
@@ -182,6 +294,7 @@ NO_IGNORE=false
 LIST_IGNORES=false
 SHOW_HELP=false
 PRINT_CONTENT=false
+RESET_CONFIG=false
 IGNORE_OPS=()
 raw_inputs=()
 
@@ -192,6 +305,7 @@ while (( $# )); do
     --no-ignore)    NO_IGNORE=true;       shift ;;
     --list-ignores) LIST_IGNORES=true;    shift ;;
     --print)        PRINT_CONTENT=true;   shift ;;
+    --reset-config) RESET_CONFIG=true;    shift ;;
     --help|-h)      SHOW_HELP=true;       shift ;;
     --ignore)
       shift
@@ -207,32 +321,70 @@ done
 
 [[ "$SHOW_HELP" == true ]] && { print_help; exit 0; }
 
+# Reset Config Handler
+if [[ "$RESET_CONFIG" == true ]]; then
+  echo "${YELLOW}This will overwrite ${BOLD}$CONFIG${RESET}${YELLOW} with factory defaults.${RESET}"
+  read -r -p "Are you sure? [y/N] " confirm
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    get_default_config > "$CONFIG"
+    echo "${GREEN}Configuration restored.${RESET}"
+  else
+    echo "Cancelled."
+  fi
+  exit 0
+fi
+
 # ------------------------------------------------------------------------------
-# 7) LOAD IGNORES (YAML PARSING)
+# 7) LOAD IGNORES (YAML ARSING & SELF-HEALING)
 # ------------------------------------------------------------------------------
 # We manually parse the simple YAML format to avoid requiring 'yq' dependency.
 ignore_dirs=()
 ignore_files=()
+parse_error=false
+error_msg=""
 
 if [[ -r "$CONFIG" ]]; then
-  block=""
-  while IFS= read -r line; do
-    # Trim leading whitespace
-    line="${line#"${line%%[![:space:]]*}"}"
-    [[ -z "$line" ]] && continue
-    case "$line" in
-      ignore_dirs:*)   block="dirs"   ;;
-      ignore_files:*)  block="files"  ;;
-      -\ *) 
-        # Clean quotes and list bullets
-        item="${line#- }"
-        item="${item%\"}"; item="${item#\"}"; item="${item%\'}"; item="${item#\'}"
-        if [[ "$block" == "dirs" ]]; then ignore_dirs+=( "$item" ); fi
-        if [[ "$block" == "files" ]]; then ignore_files+=( "$item" ); fi
-        ;;
-      *) block="" ;;
-    esac
-  done <"$CONFIG"
+  while IFS='|' read -r type value; do
+    if [[ "$type" == "ERR" ]]; then
+      parse_error=true
+      error_msg="$value"
+      break
+    elif [[ "$type" == "D" ]]; then
+      ignore_dirs+=( "$value" )
+    elif [[ "$type" == "F" ]]; then
+      ignore_files+=( "$value" )
+    fi
+  done < <(awk '
+    { raw = $0; sub(/#.*/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); }
+    length($0) == 0 { next }
+    /^ignore_dirs:/  { block="D"; next }
+    /^ignore_files:/ { block="F"; next }
+    /^- / {
+      if (block == "") { print "ERR|Orphaned item: " raw; exit 1 }
+      sub(/^- /, ""); gsub(/^["\x27]|["\x27]$/, "");
+      if (block == "D") print "D|" $0;
+      if (block == "F") print "F|" $0;
+      next
+    }
+    { print "ERR|Syntax error: " raw; exit 1 }
+  ' "$CONFIG")
+fi
+
+# SELF-HEALING LOGIC
+if [[ "$parse_error" == true ]]; then
+  printf "\n%s\n" "${CLR_ERROR}Config Corrupted in ${BOLD}$CONFIG${RESET}" >&2
+  printf "%s\n" "${CLR_ERROR}➤ $error_msg${RESET}" >&2
+  printf "\n${YELLOW}Would you like to reset to factory defaults? [y/N]${RESET} "
+  read -r -n 1 response < /dev/tty
+  echo
+  if [[ "$response" =~ ^[Yy]$ ]]; then
+    get_default_config > "$CONFIG"
+    echo "${GREEN}Configuration reset. Retrying...${RESET}"
+    exec "$0" "${raw_inputs[@]}" # Restart script
+  else
+    echo "${RED}Aborting. Please fix the file manually.${RESET}"
+    exit 1
+  fi
 fi
 
 # ------------------------------------------------------------------------------
@@ -302,10 +454,10 @@ if [[ "$LIST_IGNORES" == true ]]; then
   printf "${DIM}%s${RESET}\n" "$CONFIG"
   
   printf "\n${BOLD}Ignored Directories (YAML):${RESET}\n"
-  for d in "${ignore_dirs[@]}"; do printf "  ${CLR_ERROR}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d"; done
+  for d in "${ignore_dirs[@]:-}"; do printf "  ${CLR_ERROR}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d"; done
   
   printf "\n${BOLD}Ignored Files (YAML):${RESET}\n"
-  for f in "${ignore_files[@]}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f"; done
+  for f in "${ignore_files[@]:-}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f"; done
 
   # Also show .gitignore if we are in a repo, so user sees full context
   if git rev-parse --show-toplevel &>/dev/null; then
@@ -346,7 +498,7 @@ for arg in "${raw_inputs[@]}"; do
     # 1. Build PRUNE options from YAML (optimization for 'find')
     search_prune_opts=()
     if [[ "$NO_IGNORE" == false ]]; then
-      for d in "${ignore_dirs[@]}"; do search_prune_opts+=( -name "$d" -prune -o ); done
+      for d in "${ignore_dirs[@]:-}"; do search_prune_opts+=( -name "$d" -prune -o ); done
     fi
 
     found=()
@@ -369,7 +521,12 @@ for arg in "${raw_inputs[@]}"; do
       printf "%s\n" "${BOLD}Multiple matches for '$arg':${RESET}"
       for i in "${!found[@]}"; do printf "  ${BOLD}%2d)${RESET} ${CLR_DIR}%s${RESET}\n" $((i+1)) "${found[i]}"; done
       read -rp "Choose [1-${#found[@]}]: " c
-      targets+=( "${found[c-1]}" )
+      if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#found[@]} )); then
+        targets+=( "${found[c-1]}" )
+      else
+        printf "%s\n" "${CLR_ERROR}Invalid selection.${RESET}" >&2
+        exit 1
+      fi
     fi
   fi
 done
@@ -382,7 +539,7 @@ done
 # If not using git, we rely on 'find'. We pre-build the exclusion args here.
 find_opts=()
 if [[ "$NO_IGNORE" == false ]]; then
-  for d in "${ignore_dirs[@]}"; do find_opts+=( -name "$d" -prune -o ); done
+  for d in "${ignore_dirs[@]:-}"; do find_opts+=( -name "$d" -prune -o ); done
 fi
 find_opts+=( -type f )
 find_opts+=( -print0 )
@@ -410,7 +567,7 @@ if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]]; then
        # Apply additional YAML file-ignores (Git doesn't know about our local config)
        filename=$(basename "$f")
        skip=false
-       for pat in "${ignore_files[@]}"; do
+       for pat in "${ignore_files[@]:-}"; do
          if [[ "$filename" == $pat ]]; then skip=true; break; fi
        done
        [[ "$skip" == true ]] && continue
@@ -439,7 +596,7 @@ else
       if [[ "$NO_IGNORE" == false ]]; then
         filename=$(basename "$f")
         skip=false
-        for pat in "${ignore_files[@]}"; do
+        for pat in "${ignore_files[@]:-}"; do
            if [[ "$filename" == $pat ]]; then skip=true; break; fi
         done
         [[ "$skip" == true ]] && continue
@@ -529,7 +686,6 @@ done < "$LISTFILE"
 
 # Send to MacOS Clipboard
 pbcopy < "$TMPFILE"
-
 printf "\n${CLR_SUCCESS}✔${RESET} ${BOLD}Copied to clipboard!${RESET}\n"
 
 # Optional: Print to stdout (for piping to files)
