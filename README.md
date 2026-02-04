@@ -1,143 +1,167 @@
-# catclip
+# catclip - conCATenate to CLIPboard
 
-`catclip` is a simple Bash utility for macOS that concatenates all files under one or more target directories (with `# File: <path>` headers), applies customizable ignore lists, and copies the result to the clipboard with a single command. It was born out of the frustration of running:
-
+One command to copy your entire codebase to clipboard for AI assistants.
 ```bash
-echo "$(cat *)" | pbcopy
+catclip src  # That's it.
 ```
 
-—and wanting an easy way to grab *entire* directory contents (recursively) without manual filtering.
+**Why?** Born from the frustration of `echo "$(cat *)" | pbcopy` and wanting 
+recursive directory copying without manual filtering.
 
 ---
 
 ## Features
 
-* **Recursive concatenation** of files under one or more targets
-* Automatic **`# File: <full-path>`** headers for clarity
-* **Ignore lists** (files & directories) stored in YAML
-* Built‑in commands for listing and updating ignore patterns
-* Optionally **print** the concatenated output
-* Reports which directories contributed files
-* macOS clipboard integration via `pbcopy`
-
----
-
-## Prerequisites
-
-* macOS (relies on `pbcopy`)
-* Bash (with `set -euo pipefail` semantics)
-* Tools: `find`, `realpath`, `mktemp`
+- 🔍 Fuzzy search - `catclip components` finds any nested directory
+- 🔗 Chained paths - `catclip auth/components/Login.tsx` more specific in case there are multiple directories with the same name
+- 🛡️ Secret protection - Blocks `.env`, keys, credentials
+- 🌳 Visual preview - Tree view before copying
+- 🙈 Git-aware - Respects `.gitignore`
 
 ---
 
 ## Installation
-
-You can install using the provided `install.sh` script:
-
 ```bash
-# Clone the repo:
-git clone https://github.com/<you>/catclip.git
-cd catclip
-
-# (Optional) Install to a custom prefix:
-PREFIX=/opt/local ./install.sh
-
-# Default install:
-./install.sh
+git clone https://github.com/you/catclip.git
+cd catclip && ./install.sh
 ```
 
-This will copy `catclip` into `$(PREFIX:-/usr/local)/bin` and initialize a default `ignore.yaml` in your `~/.config/catclip/` directory.
+**Requirements**: Bash 3.2+, clipboard tool (auto-detected)
+- macOS: Built-in ✓
+- Linux: `xclip` or `wl-clipboard`
+- WSL: Built-in ✓
 
-You can also install manually:
+<details><summary>Manual installation</summary>
 
 ```bash
 cp catclip /usr/local/bin/
 mkdir -p ~/.config/catclip
 cp ignore.yaml ~/.config/catclip/ignore.yaml
 ```
+</details>
+
+<details><summary>Updating & Uninstalling</summary>
+
+```bash
+# Update
+git pull && ./install.sh
+
+# Uninstall
+./uninstall.sh
+```
+</details>
 
 ---
 
-## Usage
-
+## Try It
+The repository includes an `example-react` project to experiment with:
 ```bash
-catclip [OPTIONS] [TARGETS...]
+cd example-react
+catclip components       # Fuzzy search
+catclip hooks/useAuth.ts # Chained path
 ```
 
-* If no `TARGETS` are provided, `.` is used (current directory).
-* The output is copied directly to the macOS clipboard via `pbcopy`.
-* Use `--print` to also echo the output to stdout.
+---
 
-### Options
-
-| Flag             | Description                                           |
-| ---------------- | ----------------------------------------------------- |
-| `-h`, `--help`   | Show help and usage information.                      |
-| `--no-ignore`    | Ignore your YAML filters and copy *all* files.        |
-| `--list-ignores` | Display current ignore directories and file patterns. |
-| `--ignore <ops>` | Modify the YAML ignore lists and exit. Ops can be:    |
-|                  | • `+pattern` add a file-pattern to ignore             |
-|                  | • `-pattern` remove a file-pattern                    |
-|                  | • `d+dirname` add a directory to ignore               |
-|                  | • `d-dirname` remove a directory from ignore          |
-| `--print`        | Also print the concatenated output to stdout.         |
-
-### Examples
-
+## Quick Start
 ```bash
-# Copy all .c and .h files from src/, ignoring node_modules:
+# Copy source directory:
 catclip src
 
-# Copy everything (no ignores):
-catclip --no-ignore ~/projects/foo
+# Fuzzy search:
+catclip components              # Finds any 'components' dir
 
-# Show current ignore rules:
-catclip --list-ignores
-
-# Add a new ignore pattern and exit:
-catclip --ignore +*.log -temp.txt d+build
-
-# Copy and print to terminal:
-catclip --print docs/
+# Specific file via chained path:
+catclip auth/components/Login.tsx
 ```
+
+<details>
+<summary><b>More Examples</b></summary>
+
+```bash
+# Copy multiple targets:
+catclip README.md src config/
+
+# Override filters:
+catclip --no-ignore dist
+
+# Copy & Print to stdout:
+catclip --print src
+```
+
+</details>
 
 ---
 
 ## Configuration
 
-The default ignore lists live in:
-
-```
-$XDG_CONFIG_HOME/catclip/ignore.yaml
-# usually ~/.config/catclip/ignore.yaml
-```
-
+Default location: `~/.config/catclip/ignore.yaml`
 ```yaml
 ignore_dirs:
   - node_modules
   - .git
-  # …
 ignore_files:
-  - '*.pyc'
-  - '*.class'
-  # …
+  - '*.log'
+  - .env
 ```
 
-Use `catclip --ignore` to add or remove patterns without editing by hand.
+Quick config:
+`catclip --ignore +'*.log' -'old.tmp' d+build d-src`
+
+*Adds `*.log` and `build/`, removes `old.tmp` and `src/` from ignore list*
+
+---
+
+## Options
+
+| Flag | Description |
+|------|-------------|
+| `-h` | Show help |
+| `-y` | Skip confirmation |
+| `--no-ignore` | Include ignored files |
+| `--list-ignores` | Show ignore rules |
+| `--ignore <ops>` | Modify ignore list |
+
+Full docs: `catclip --help`
+
+---
+
+## Troubleshooting
+
+<details>
+<summary><b>No clipboard tool found</b></summary>
+
+Install for your platform:
+```bash
+# Ubuntu/Debian
+sudo apt install xclip  # or wl-clipboard for Wayland
+
+# Fedora
+sudo dnf install xclip # or wl-clipboard for Wayland
+
+# Arch
+sudo pacman -S xclip # or wl-clipboard for Wayland
+```
+Or fallback to stdout: `catclip --print src > code.txt`
+
+</details>
+
+<details>
+<summary><b>Directory ignored</b></summary>
+
+Check: `catclip --list-ignores`
+Bypass once: `catclip --no-ignore name`
+or
+Permanently un-ignore: `catclip --ignore d-name`
+
+</details>
 
 ---
 
 ## Contributing
 
-1. Fork the repo & clone.
-2. Create a branch: `git checkout -b feature/your-change`.
-3. Make your changes & test on macOS.
-4. Submit a Pull Request.
+PRs welcome! Keep changes POSIX-compatible and test on macOS.
 
-Please keep changes small and scripts POSIX‑compatible where possible.
-
----
-
-## License
-
-This project is released under the [MIT License](LICENSE).
+1. Fork & clone
+2. Create branch: `git checkout -b feature/name`
+3. Submit PR

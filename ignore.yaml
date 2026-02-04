@@ -52,58 +52,47 @@ ignore_dirs:
   - __fixtures__
 
 ignore_files:
-  # System
+  # System Files
   - .DS_Store
   - .AppleDouble
   - .LSOverride
 
-  # Binaries & Archives
-  - "*.class"
-  - "*.pyc"
-  - "*.pyo"
-  - "*.exe"
-  - "*.dll"
-  - "*.so"
-  - "*.dylib"
-  - "*.jar"
-  - "*.war"
-  - "*.zip"
-  - "*.tar.gz"
-  - "*.db"
-  - "*.sqlite"
-  
-  # Media
-  - "*.png"
-  - "*.jpg"
-  - "*.jpeg"
-  - "*.gif"
-  - "*.ico"
-  - "*.svg"
-  - "*.pdf"
-  - "*.mov"
-  - "*.mp4"
-  - "*.webm"
+  # -------------------------------------------------------------------------
+  # NOTE: Binary files (images, audio, video, archives, executables, etc.)
+  # are NOT listed here because is_text_file() TIER 1 automatically blocks
+  # them at the code level. This config only needs to list TEXT files we
+  # want to skip.
+  # -------------------------------------------------------------------------
 
-  # Lockfiles
+  # Lockfiles (Text but Noisy - use --no-ignore if needed)
   - package-lock.json
   - yarn.lock
   - pnpm-lock.yaml
   - poetry.lock
   - Pipfile.lock
-  - bun.lockb
+  - Gemfile.lock
+  - composer.lock
+  - Cargo.lock
+  - go.sum
   
-  # Secrets (CRITICAL)
+  # Secrets (CRITICAL - Never leak)
   - .env
   - .env.local
   - .env.*
   - "*.pem"
   - "*.key"
+  - "*.p12"
+  - "*.pfx"
   - id_rsa
+  - id_ed25519
   - application.properties
   - application.yml
+  - secrets.yaml
+  - credentials.json
 
-  # Logs
+  # Logs & Temp
   - "*.log"
   - "*.tmp"
   - "*.bak"
   - "*.swp"
+  - "*.swo"

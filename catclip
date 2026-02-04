@@ -27,14 +27,114 @@ IFS=$'\n\t'
 # Force 256-color mode for consistent output in restricted shells.
 export TERM="${TERM:-xterm-256color}"
 
+# 0.5) OS DETECTION
+# Detect OS once at startup for platform-specific behavior.
+# WSL detected via /proc/version (contains "Microsoft" or "WSL").
+detect_os() {
+  case "$(uname -s)" in
+    Darwin) echo "macos" ;;
+    Linux)
+      if [[ -f /proc/version ]] && grep -qiE '(microsoft|wsl)' /proc/version 2>/dev/null; then
+        echo "wsl"
+      else
+        echo "linux"
+      fi
+      ;;
+    CYGWIN*|MINGW*|MSYS*) echo "wsl" ;;  # Treat Cygwin/MinGW as WSL-like
+    *) echo "unknown" ;;
+  esac
+}
+OS_TYPE="$(detect_os)"
+
 # 1) PREREQUISITE CHECKS
-# Fail fast if essential tools are missing.
-for cmd in pbcopy find mktemp awk stat git file; do
+# Fail fast if essential tools are missing. Git and clipboard checked separately.
+for cmd in find mktemp awk file; do
   if ! command -v "$cmd" &>/dev/null; then
     echo "Error: '$cmd' is required but not found in PATH." >&2
     exit 1
   fi
 done
+
+# Check for git (optional - enables .gitignore support)
+HAS_GIT=false
+if command -v git &>/dev/null; then
+  HAS_GIT=true
+fi
+
+# 1.5) CLIPBOARD DETECTION
+# Detect available clipboard command based on OS and display server.
+# Session-aware: wl-copy only on Wayland, xclip/xsel only on X11.
+detect_clipboard_cmd() {
+  case "$OS_TYPE" in
+    macos)
+      if command -v pbcopy &>/dev/null; then
+        echo "pbcopy"
+        return 0
+      fi
+      ;;
+    wsl)
+      # WSL: prefer clip.exe for direct Windows clipboard
+      if command -v clip.exe &>/dev/null; then
+        echo "clip.exe"
+        return 0
+      fi
+      ;;
+  esac
+  
+  # Linux: detect display server and use appropriate tool
+  local is_wayland=false
+  if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    is_wayland=true
+  fi
+  
+  if [[ "$is_wayland" == true ]]; then
+    # Wayland: prefer wl-copy, fall back to xclip/xsel (via XWayland)
+    if command -v wl-copy &>/dev/null; then
+      echo "wl-copy"
+      return 0
+    elif command -v xclip &>/dev/null; then
+      echo "xclip -selection clipboard"
+      return 0
+    elif command -v xsel &>/dev/null; then
+      echo "xsel --clipboard --input"
+      return 0
+    fi
+  else
+    # X11: prefer xclip/xsel, skip wl-copy (it won't work)
+    if command -v xclip &>/dev/null; then
+      echo "xclip -selection clipboard"
+      return 0
+    elif command -v xsel &>/dev/null; then
+      echo "xsel --clipboard --input"
+      return 0
+    fi
+  fi
+  
+  return 1
+}
+
+CLIPBOARD_CMD=""
+if ! CLIPBOARD_CMD="$(detect_clipboard_cmd)"; then
+  echo "Error: No clipboard tool found." >&2
+  case "$OS_TYPE" in
+    macos) echo "  Install Xcode command line tools or ensure pbcopy is in PATH." >&2 ;;
+    wsl)   echo "  Ensure clip.exe is available, or install xclip." >&2 ;;
+    linux) 
+           # Detect display server to recommend the right tool
+           if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+             echo "  Wayland detected. Install wl-clipboard:" >&2
+             echo "    Ubuntu/Debian: sudo apt install wl-clipboard" >&2
+             echo "    Fedora/RHEL:   sudo dnf install wl-clipboard" >&2
+             echo "    Arch:          sudo pacman -S wl-clipboard" >&2
+           else
+             echo "  X11 detected. Install xclip:" >&2
+             echo "    Ubuntu/Debian: sudo apt install xclip" >&2
+             echo "    Fedora/RHEL:   sudo dnf install xclip" >&2
+             echo "    Arch:          sudo pacman -S xclip" >&2
+           fi ;;
+  esac
+  exit 1
+fi
 
 # 2) COLORS & THEME
 # ANSI escape codes. Semantic naming (CLR_ERROR vs RED) for self-documenting code.
@@ -120,67 +220,60 @@ ignore_dirs:
   - __fixtures__
 
 ignore_files:
-  # System
+  # System Files
   - .DS_Store
   - .AppleDouble
   - .LSOverride
 
-  # Binaries & Archives
-  - "*.class"
-  - "*.pyc"
-  - "*.pyo"
-  - "*.exe"
-  - "*.dll"
-  - "*.so"
-  - "*.dylib"
-  - "*.jar"
-  - "*.war"
-  - "*.zip"
-  - "*.tar.gz"
-  - "*.db"
-  - "*.sqlite"
-  
-  # Media
-  - "*.png"
-  - "*.jpg"
-  - "*.jpeg"
-  - "*.gif"
-  - "*.ico"
-  - "*.svg"
-  - "*.pdf"
-  - "*.mov"
-  - "*.mp4"
-  - "*.webm"
-
-  # Lockfiles
+  # Lockfiles (Text but Noisy - use --no-ignore if needed)
   - package-lock.json
   - yarn.lock
   - pnpm-lock.yaml
   - poetry.lock
   - Pipfile.lock
-  - bun.lockb
+  - Gemfile.lock
+  - composer.lock
+  - Cargo.lock
+  - go.sum
   
-  # Secrets (CRITICAL)
+  # Secrets (CRITICAL - Never leak)
   - .env
   - .env.local
   - .env.*
   - "*.pem"
   - "*.key"
+  - "*.p12"
+  - "*.pfx"
   - id_rsa
+  - id_ed25519
   - application.properties
   - application.yml
+  - secrets.yaml
+  - credentials.json
 
-  # Logs
+  # Logs & Temp
   - "*.log"
   - "*.tmp"
   - "*.bak"
   - "*.swp"
+  - "*.swo"
 EOF
 }
 
+# Check if config exists, prompt to create if missing
 if [[ ! -f "$CONFIG" ]]; then
-  mkdir -p "$CONFIG_DIR"
-  get_default_config > "$CONFIG"
+  printf "\n%s\n" "${CLR_WARN}Config Not Found: ${BOLD}$CONFIG${RESET}" >&2
+  printf "%s\n" "${DIM}No ignore configuration exists.${RESET}" >&2
+  printf "\n${CLR_WARN}Would you like to create default configuration? [Y/n]${RESET} " >&2
+  read -r -n 1 response < /dev/tty
+  echo
+  if [[ "$response" =~ ^[Nn]$ ]]; then
+    echo "${CLR_WARN}Continuing without ignore rules (all text files will be included)...${RESET}" >&2
+  else
+    mkdir -p "$CONFIG_DIR"
+    get_default_config > "$CONFIG"
+    echo "${CLR_SUCCESS}Default configuration created at ${BOLD}$CONFIG${RESET}" >&2
+  fi
 fi
 
 # 4) CLEANUP TRAPS
@@ -191,6 +284,7 @@ cleanup() {
   [[ -n "$TMPFILE" && -f "$TMPFILE" ]] && rm -f "$TMPFILE"
   [[ -n "$LISTFILE" && -f "$LISTFILE" ]] && rm -f "$LISTFILE"
   [[ -n "$UTF16_LIST" && -f "$UTF16_LIST" ]] && rm -f "$UTF16_LIST"
+  : # Ensure trap returns 0
 }
 trap cleanup EXIT
 
@@ -203,6 +297,18 @@ format_size() {
     while(b >= 1024 && u < 5) { b/=1024; u++ }
     printf "%.2f%s", b, units[u]
   }'
+}
+
+# Cross-platform file size in bytes. macOS uses -f %z, Linux uses -c %s.
+get_file_size() {
+  local f="$1"
+  local size
+  case "$OS_TYPE" in
+    macos) size=$(stat -f %z "$f" 2>/dev/null) ;;
+    *)     size=$(stat -c %s "$f" 2>/dev/null) ;;
+  esac
+  # Ensure we always return a number
+  echo "${size:-0}"
 }
 
 print_tree() {
@@ -242,24 +348,27 @@ ${BOLD}Usage:${RESET}
 
 ${BOLD}Targets:${RESET}
   ${BOLD}Fuzzy Directory Search:${RESET}
-    ${CLR_SUCCESS}catclip repository${RESET}              # Finds any directory matching *repository*
-    ${CLR_SUCCESS}catclip utils${RESET}                   # Finds src/utils, lib/utils, etc. (prompts if multiple)
+    ${CLR_SUCCESS}catclip authentication${RESET}          # Finds src/features/authentication (finds any directory matching 'authentication')
+    ${CLR_SUCCESS}catclip components${RESET}              # Finds src/components, authentication/components, etc. (prompts if multiple)
   
   ${BOLD}Chained Path Resolution:${RESET}
-    ${CLR_SUCCESS}catclip repository/domain/Model.java${RESET}  # Resolves 'repository' → 'domain' → copies 'Model.java'
-    ${CLR_SUCCESS}catclip service/utils${RESET}                 # Resolves 'service' → 'utils' → copies directory contents
+    ${CLR_SUCCESS}catclip authentication/components/LoginForm.tsx${RESET}  # Resolves 'authentication' → 'components' → copies 'LoginForm.tsx'
+    ${CLR_SUCCESS}catclip authentication/api${RESET}                       # Resolves 'authentication' → 'api' → copies directory contents
 
   ${BOLD}Full Relative Paths:${RESET}
-    ${CLR_SUCCESS}catclip src/main/java/com/app/Model.java${RESET}    # Must exist from current directory
-    ${CLR_SUCCESS}catclip .github/workflows/ci.yml${RESET}            # Dotted paths work
+    ${CLR_SUCCESS}catclip src/components/ui/Button.tsx${RESET}    # Fast. Use Tab completion from root (src/[TAB]/[TAB]...)
+    ${CLR_SUCCESS}catclip src/config/constants.ts${RESET}         # Precise. Avoids ambiguity for common filenames
   
   ${BOLD}Files in Current Directory:${RESET}
     ${CLR_SUCCESS}catclip Dockerfile${RESET}              # File in current working directory
-    ${CLR_SUCCESS}catclip pom.xml README.md${RESET}       # Multiple files
+    ${CLR_SUCCESS}catclip vite.config.js tsconfig.json${RESET}  # Multiple files
   
   ${BOLD}Mixed Arguments:${RESET}
-    ${CLR_SUCCESS}catclip src repository/Model.java controller/UserController.java${RESET}
-    # → Copies entire 'src' dir + 2 specific files
+    ${CLR_SUCCESS}catclip README.md src/features/todos${RESET}
+    # → Copies 'README.md' + entire 'todos' feature directory
+
+  ${BOLD}Paths with Spaces:${RESET}
+    ${CLR_SUCCESS}catclip "docs/User Guide.md"${RESET}  # Use quotes for paths with spaces
 
 ${BOLD}Options:${RESET}
   ${CLR_SUCCESS}--help, -h${RESET}
@@ -285,6 +394,10 @@ ${BOLD}Options:${RESET}
       
       ${BOLD}Add/remove files:${RESET}  +'pattern'  -'pattern'
       ${BOLD}Add/remove dirs:${RESET}   d+dirname  d-dirname
+      
+      ${DIM}catclip --ignore +'*.log' -'secret.json' d+build d-src${RESET}
+      # → Ignores .log files, un-ignores secret.json
+      # → Ignores 'build' directory, un-ignores 'src' directory
   
   ${CLR_SUCCESS}--reset-config${RESET}
       Restore the configuration file to factory defaults.
@@ -306,38 +419,80 @@ is_text_file() {
   local f="$1"
   local ext="${f##*.}"
   
+  # ----------------------------------------------------------------------------
+  # TIER 1: HARD BLOCKS (Return 1)
+  # ----------------------------------------------------------------------------
+  # Files that are technically unreadable (binary), dangerous to print (weights),
+  # or effectively useless "token poison" (SVGs, Source Maps).
+  #
+  # Categories:
+  #   1. Images (Raster & Vector) - SVG is here because path data is token poison
+  #   2. Documents (Office & PDF are Zipped XMLs/Binaries)
+  #   3. Archives & Disk Images
+  #   4. Compiled Executables, Libraries & Debug Symbols
+  #   5. Bytecode & Virtual Machine Artifacts
+  #   6. Mobile & Package Installers
+  #   7. AI Models & Large Data (CRITICAL protection against massive files)
+  #   8. Audio & Video
+  #   9. Fonts
+  #   10. 3D & Design (Binary formats)
+  #   11. Database, Generic Binary, & Developer Noise (map=Sourcemaps, lockb=Bun)
   case "$ext" in
-    png|jpg|jpeg|gif|bmp|ico|svg|webp|pdf|\
-    zip|tar|gz|bz2|xz|7z|rar|dmg|iso|\
-    exe|dll|so|dylib|a|lib|o|obj|class|jar|war|ear|\
-    pyc|pyo|pyd|wasm|\
-    mp3|mp4|mov|avi|mkv|webm|flv|wmv|m4a|wav|flac|\
-    ttf|otf|woff|woff2|eot|\
-    db|sqlite|sqlite3)
+    png|jpg|jpeg|gif|bmp|ico|svg|webp|tif|tiff|psd|xcf|heic|raw|\
+pdf|docx|doc|xlsx|xls|pptx|ppt|odt|ods|odp|rtf|\
+zip|tar|gz|bz2|xz|7z|rar|dmg|iso|img|vmdk|qcow2|\
+exe|dll|so|dylib|a|lib|o|obj|pdb|\
+class|jar|war|ear|pyc|pyo|pyd|wasm|beam|rlib|\
+apk|aab|ipa|msi|cab|deb|rpm|\
+pt|pth|ckpt|safetensors|onnx|gguf|h5|pkl|parquet|arrow|\
+mp3|mp4|mov|avi|mkv|webm|flv|wmv|m4a|wav|flac|ogg|3gp|\
+ttf|otf|woff|woff2|eot|\
+blend|glb|fbx|3ds|\
+db|sqlite|sqlite3|bin|dat|hex|dump|map|lockb)
       return 1
       ;;
   esac
   
+  # ----------------------------------------------------------------------------
+  # TIER 2: TEXT ALLOW LIST (Return 0)
+  # ----------------------------------------------------------------------------
+  # Files strictly defined as text. We list them here to bypass the slow
+  # 'file --mime' check. This includes "Soft Blocks" like .lock or .xml
+  # which are text but usually ignored via YAML config.
+  #
+  # Categories:
+  #   1. Web & Markup
+  #   2. Configuration & Data
+  #   3. Documentation
+  #   4. Scripting & Shell
+  #   5. Compiled Languages (Source)
+  #   6. Game Dev & Graphics Code
+  #   7. Build Systems & CI/CD
+  #   8. Project Files
+  #   9. Niche / Functional / Scientific
+  #   10. Data & Specialized Formats
+  #   11. Modern Frameworks & Templates
   case "$ext" in
-    txt|md|markdown|json|yaml|yml|xml|html|htm|css|scss|sass|less|\
-    js|jsx|mjs|cjs|ts|tsx|mts|cts|\
-    py|pyw|pyi|rb|java|php|sh|bash|zsh|fish|sql|\
-    c|cc|cpp|cxx|h|hh|hpp|hxx|\
-    go|rs|swift|kt|kts|scala|cs|fs|vb|vbs|\
-    gd|godot|shader|unity|\
-    makefile|Makefile|mk|cmake|gradle|jenkinsfile|Jenkinsfile|\
-    dockerfile|Dockerfile|groovy|gvy|tf|hcl|toml|ini|cfg|conf|properties|\
-    sln|csproj|vbproj|\
-    r|R|clj|cljs|ex|exs|erl|hrl|elm|nim|zig|v|d|m|mm|\
-    hs|lhs|jl|cl|lisp|rkt|\
-    csv|tsv|patch|diff|lock|\
-    graphql|gql|proto|sol|ps1|psm1|psd1|bat|cmd|asm|s|\
-    vim|lua|pl|pm|dart|vue|svelte|astro|\
-    rst|adoc|tex|j2|ejs|hbs|mustache|liquid)
+    html|htm|css|scss|sass|less|js|jsx|mjs|cjs|ts|tsx|mts|cts|\
+json|yaml|yml|xml|toml|ini|cfg|conf|properties|env|lock|\
+md|markdown|txt|text|rst|adoc|\
+py|pyw|pyi|ipynb|rb|erb|haml|pl|pm|lua|sh|bash|zsh|fish|bat|cmd|ps1|psm1|psd1|\
+c|cc|cpp|cxx|h|hh|hpp|hxx|go|rs|swift|kt|kts|scala|cs|fs|vb|vbs|java|jsp|php|sql|\
+gd|godot|shader|unity|qml|\
+makefile|Makefile|mk|cmake|gradle|jenkinsfile|Jenkinsfile|\
+dockerfile|Dockerfile|groovy|gvy|tf|hcl|\
+sln|csproj|vbproj|fsproj|\
+r|R|rmd|clj|cljs|ex|exs|erl|hrl|elm|nim|zig|v|d|m|mm|\
+hs|lhs|jl|cl|lisp|rkt|asm|s|\
+csv|tsv|graphql|gql|proto|sol|patch|diff|\
+vim|dart|vue|svelte|astro|tex|j2|ejs|hbs|mustache|liquid|pug|jade)
       return 0
       ;;
   esac
   
+  # ----------------------------------------------------------------------------
+  # TIER 3: SLOW FALLBACK
+  # ----------------------------------------------------------------------------
   local mime
   mime=$(file -b --mime "$f" 2>/dev/null)
   
@@ -418,7 +573,7 @@ fuzzy_search_dir() {
       return 0
     else
       printf "%s\n" "${CLR_ERROR}Invalid selection.${RESET}" >&2
-      exit 1
+      exit 2
     fi
   fi
 }
@@ -443,6 +598,9 @@ resolve_chained_path() {
       if resolved=$(fuzzy_search_dir "$segment" "$current_base"); then
         current_base="$resolved"
       else
+        local ret=$?
+        if (( ret == 2 )); then exit 2; fi
+        
         printf "%s\n" "${CLR_ERROR}Error: No directory matching '$segment' found in $current_base${RESET}" >&2
         return 1
       fi
@@ -476,6 +634,19 @@ check_file_ignore() {
 # IGNORE_REASON tracks which source matched, for better error messages.
 
 # Returns 0 if ignored, 1 if allowed. Sets IGNORE_REASON to "yaml" or "gitignore".
+# Returns 0 if ignored by YAML config only.
+is_dir_ignored_yaml() {
+  local dirname="$1"
+  if [[ "$NO_IGNORE" == true ]]; then return 1; fi
+  if (( ${#ignore_dirs[@]} > 0 )); then
+    for d in "${ignore_dirs[@]}"; do
+      if [[ "$dirname" == "$d" ]]; then return 0; fi
+    done
+  fi
+  return 1
+}
+
+# Returns 0 if ignored, 1 if allowed. Sets IGNORE_REASON.
 is_dir_ignored() {
   local dirpath="$1"
   local dirname
@@ -487,13 +658,9 @@ is_dir_ignored() {
   fi
   
   # Check YAML config first
-  if (( ${#ignore_dirs[@]} > 0 )); then
-    for d in "${ignore_dirs[@]}"; do
-      if [[ "$dirname" == "$d" ]]; then
-        IGNORE_REASON="yaml"
-        return 0
-      fi
-    done
+  if is_dir_ignored_yaml "$dirname"; then
+    IGNORE_REASON="yaml"
+    return 0
   fi
   
   # Check git ignore if in git repo
@@ -531,6 +698,7 @@ print_dir_ignore_msg() {
   echo >&2
   
   [[ "$msg_type" == "error" ]] && printf "${DIM}Use --no-ignore to include it anyway.${RESET}\n" >&2
+  return 0
 }
 
 extract_dir_components() {
@@ -545,6 +713,45 @@ extract_dir_components() {
   for comp in "${components[@]}"; do
     echo "$comp"
   done
+}
+
+# Traverse up the path to check if any parent directory is ignored
+# Traverse up the path to check if any parent directory is ignored
+check_parent_ignores() {
+  local path="$1"
+  local current_dir
+  current_dir=$(dirname "$path")
+  
+  # 1. OPTIMIZATION: Check YAML ignores in loop (fast, pure Bash)
+  while [[ "$current_dir" != "." && "$current_dir" != "/" && -n "$current_dir" ]]; do
+    if is_dir_ignored_yaml "$(basename "$current_dir")"; then
+      IGNORE_REASON="yaml"
+      print_dir_ignore_msg "$(basename "$current_dir")" "warning"
+      return 0
+    fi
+    current_dir=$(dirname "$current_dir")
+  done
+  
+  # 2. OPTIMIZATION: Check Git ignores ONCE on the full path (slow, spawns process)
+  # git check-ignore handles recursive parent checks natively.
+  if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]]; then
+    # If the path matches a gitignore rule, we need to determine WHICH directory is ignored
+    # to provide a helpful warning. We scan up the tree to find the culprit.
+    if git check-ignore -q "$path" 2>/dev/null; then
+       
+       local check_dir=$(dirname "$path")
+       while [[ "$check_dir" != "." && "$check_dir" != "/" && -n "$check_dir" ]]; do
+         if git check-ignore -q "$check_dir" 2>/dev/null; then
+             IGNORE_REASON="gitignore"
+             print_dir_ignore_msg "$(basename "$check_dir")" "warning"
+             return 0
+         fi
+         check_dir=$(dirname "$check_dir")
+       done
+    fi
+  fi
+  
+  return 0
 }
 
 # 6) FLAG PARSING
@@ -646,6 +853,23 @@ if [[ "$parse_error" == true ]]; then
   fi
 fi
 
+# Check for empty config (both arrays empty = likely broken/cleared config)
+if (( ${#ignore_dirs[@]} == 0 && ${#ignore_files[@]} == 0 )); then
+  printf "\n%s\n" "${CLR_WARN}Config Empty in ${BOLD}$CONFIG${RESET}" >&2
+  printf "%s\n" "${DIM}No ignore rules defined. This may cause unexpected behavior.${RESET}" >&2
+  printf "\n${CLR_WARN}Would you like to reset to factory defaults? [y/N]${RESET} " >&2
+  read -r -n 1 response < /dev/tty
+  echo
+  if [[ "$response" =~ ^[Yy]$ ]]; then
+    get_default_config > "$CONFIG"
+    echo "${CLR_SUCCESS}Configuration reset. Retrying...${RESET}" >&2
+    exec "$0" "$@"
+  else
+    echo "${CLR_WARN}Continuing with empty config...${RESET}" >&2
+  fi
+fi
+
+
 # 8) CONFIG UPDATE LOGIC
 if (( ${#IGNORE_OPS[@]} > 0 )); then
   printf "%s\n" "${BOLD}Updating ignore list in ${DIM}$CONFIG${RESET}" >&2
@@ -694,7 +918,7 @@ if (( ${#IGNORE_OPS[@]} > 0 )); then
   printf "\n${BOLD}Changes applied:${RESET}\n" >&2
   for change in "${changes_log[@]}"; do printf "  %s\n" "$change" >&2; done
 
-  if git rev-parse --show-toplevel &>/dev/null; then
+  if [[ "$HAS_GIT" == true ]] && git rev-parse --show-toplevel &>/dev/null; then
     printf "\n${CLR_GIT}Note: Files listed in .gitignore remain excluded automatically.${RESET}\n" >&2
   else
     printf "\n${DIM}Note: If used inside a Git project, .gitignore rules will also apply.${RESET}\n" >&2
@@ -713,7 +937,7 @@ if [[ "$LIST_IGNORES" == true ]]; then
   printf "\n${BOLD}Ignored Files (YAML):${RESET}\n" >&2
   for f in "${ignore_files[@]:-}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f" >&2; done
 
-  if git rev-parse --show-toplevel &>/dev/null; then
+  if [[ "$HAS_GIT" == true ]] && git rev-parse --show-toplevel &>/dev/null; then
     git_root=$(git rev-parse --show-toplevel)
     git_ignore_file="$git_root/.gitignore"
     if [[ -f "$git_ignore_file" ]]; then
@@ -733,7 +957,7 @@ fi
 (( ${#raw_inputs[@]} == 0 )) && raw_inputs=( "." )
 
 IS_GIT=false
-if git rev-parse --show-toplevel &>/dev/null 2>&1; then IS_GIT=true; fi
+if [[ "$HAS_GIT" == true ]] && git rev-parse --show-toplevel &>/dev/null 2>&1; then IS_GIT=true; fi
 
 file_targets=()
 dir_targets=()
@@ -756,7 +980,7 @@ for arg in "${raw_inputs[@]}"; do
       fi
       dir_targets+=( "./$arg" )
       
-    elif resolved_dir=$(fuzzy_search_dir "$arg"); then
+      elif resolved_dir=$(fuzzy_search_dir "$arg"); then
       # Found matching directories via fuzzy search
       if is_dir_ignored "$resolved_dir"; then
         resolved_name=$(basename "$resolved_dir")
@@ -765,16 +989,24 @@ for arg in "${raw_inputs[@]}"; do
       fi
       dir_targets+=( "$resolved_dir" )
       
-    elif [[ -f "$arg" ]]; then
-      # Local file exists (only match if no directory found)
-      if check_file_ignore "$arg"; then
-        printf "%s\n" "${CLR_ERROR}Error: File '$arg' is ignored by pattern.${RESET}" >&2
-        printf "${DIM}Use --no-ignore to include it anyway.${RESET}\n" >&2
-        exit 1
-      fi
-      file_targets+=( "./$arg" )
+    else
+      # Check exit code of fuzzy search (it runs in subshell for command substitution)
+      # But since we used 'elif', we lost the exit code? No, 'elif command' failure exit status is available?
+      # Actually, clean way is to re-check if we need to abort.
+      # Bash behavior: if the condition failed, $? holds the return code.
+      ret=$?
+       if (( ret == 2 )); then exit 2; fi
+       
+       if [[ -f "$arg" ]]; then
+        # Local file exists (only match if no directory found)
+        if check_file_ignore "$arg"; then
+          printf "%s\n" "${CLR_ERROR}Error: File '$arg' is ignored by pattern.${RESET}" >&2
+          printf "${DIM}Use --no-ignore to include it anyway.${RESET}\n" >&2
+          exit 1
+        fi
+        file_targets+=( "./$arg" )
       
-    elif [[ "$arg" == *.* ]]; then
+      elif [[ "$arg" == *.* ]]; then
       # Looks like a filename but not found
       printf "%s\n" "${CLR_ERROR}Error: File '$arg' not found in working directory.${RESET}" >&2
       printf "\n${DIM}Hint: For files outside working directory, use:${RESET}\n" >&2
@@ -791,6 +1023,7 @@ for arg in "${raw_inputs[@]}"; do
       printf "  ${CLR_SUCCESS}catclip src${RESET}              ${DIM}(fuzzy match 'src' directory)${RESET}\n" >&2
       exit 1
     fi
+    fi
     
   # BRANCH 2: Has slashes - path resolution (exact or chained)
   else
@@ -806,6 +1039,10 @@ for arg in "${raw_inputs[@]}"; do
           printf "${DIM}Use --no-ignore to include it anyway.${RESET}\n" >&2
           exit 1
         fi
+        
+        # Check if parent directory is ignored
+        check_parent_ignores "$arg"
+        
         if ! is_text_file "$arg"; then
           printf "%s\n" "${CLR_ERROR}Error: File '$filename' is a binary file and cannot be copied.${RESET}" >&2
           exit 1
@@ -837,10 +1074,9 @@ for arg in "${raw_inputs[@]}"; do
         dir_targets+=( "$full_path" )
         
       elif [[ -f "$full_path" ]]; then
-        if is_dir_ignored "$resolved_dir"; then
-          resolved_name=$(basename "$resolved_dir")
-          print_dir_ignore_msg "$resolved_name" "warning"
-        fi
+        # Check if parent directory is ignored (using recursive check)
+        check_parent_ignores "$full_path"
+        
         if ! is_text_file "$full_path"; then
           printf "%s\n" "${CLR_ERROR}Error: File '$filename' is a binary file and cannot be copied.${RESET}" >&2
           exit 1
@@ -886,7 +1122,7 @@ if (( ${#file_targets[@]} > 0 )); then
     if is_text_file "$f"; then
       normalized="${f#./}"
       echo "$normalized" >> "$LISTFILE"
-      ((count++))
+      ((++count))
       printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "$normalized" >&2
     fi
   done
@@ -895,8 +1131,142 @@ fi
 # PHASE 1B: Process directories
 if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]] && (( ${#dir_targets[@]} > 0 )); then
   # GIT MODE
+  # GIT MODE
   for tgt in "${dir_targets[@]}"; do
-    while IFS= read -r f; do
+    # Check if this target belongs to a DIFFERENT git root (nested repo)
+    # We resolve the absolute path to be sure
+    abs_tgt=$(cd "$tgt" && pwd)
+    tgt_git_root=$(git -C "$abs_tgt" rev-parse --show-toplevel 2>/dev/null || echo "")
+    
+    # Calculate relation to current root
+    current_git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    
+    # Defaults for standard intra-repo behavior
+    git_cmd=(git ls-files --cached --others --exclude-standard "$tgt")
+    is_nested=false
+    
+    if [[ -n "$tgt_git_root" && "$tgt_git_root" != "$current_git_root" ]]; then
+      # NESTED REPO DETECTED
+      is_nested=true
+      
+      # Run ls-files INSIDE the nested repo.
+      # git -C "$tgt" ls-files lists files relative to "$tgt".
+      # We will prefix "$tgt/" to each line in the loop below to make it relative to CWD.
+      git_cmd=(git -C "$tgt" ls-files --cached --others --exclude-standard)
+    else
+      # STANDARD REPO: Check for HIDDEN nested repos inside this target
+      # e.g. running 'catclip .' where 'example-project' is a subdir with .git
+      
+      nested_repos=()
+      while IFS= read -r -d '' git_dir; do
+        repo_root=$(dirname "$git_dir")
+        
+        # Resolve absolute path for comparison
+        abs_repo_root=$(cd "$repo_root" && pwd)
+        
+        # Skip if it's the main repo's root
+        [[ "$abs_repo_root" == "$current_git_root" ]] && continue
+        
+        # Skip if it matches the current git root (redundant check?)
+        # current_git_root is already absolute.
+        
+        # Verify it's actually a directory we can reach
+        if [[ -d "$repo_root" ]]; then
+             nested_repos+=( "$repo_root" )
+        fi
+      done < <(find "$tgt" -name ".git" -type d -prune -print0 2>/dev/null)
+      
+      if (( ${#nested_repos[@]} > 0 )); then
+        plural="ies"
+        if (( ${#nested_repos[@]} == 1 )); then plural="y"; fi
+        
+        printf "\n${CLR_WARN}Found %d nested git repositor%s in ${BOLD}%s${RESET}:${RESET}\n" \
+          "${#nested_repos[@]}" "$plural" "${tgt}" >&2
+        
+        for repo in "${nested_repos[@]}"; do
+          printf "  ${CLR_GIT}•${RESET} %s\n" "${repo#./}" >&2
+        done
+        
+        include_nested=false
+        if [[ "$SKIP_CONFIRM" == true ]]; then
+           echo "${DIM}Auto-including nested repositories (--yes)...${RESET}" >&2
+           include_nested=true
+        else
+          printf "\n${CLR_PROMPT}Include nested repositories? [Y/n]${RESET} " >&2
+          read -r -n 1 response < /dev/tty
+          echo >&2
+          if [[ "$response" =~ ^[Yy]$ || -z "$response" ]]; then
+            include_nested=true
+          fi
+        fi
+        
+        if [[ "$include_nested" == true ]]; then
+           for nested_repo in "${nested_repos[@]}"; do
+             # Add the nested repo files effectively as if it was a target
+             # logic similar to the 'is_nested' block but inside this loop
+             
+             printf "${DIM}  └─ Processing: ${CLR_GIT}%s${RESET}\n" "${nested_repo#./}" >&2
+             
+             while IFS= read -r nested_file; do
+                # Determine absolute path of file to check textness/ignores
+                # nested_file is relative to nested_repo
+                
+                # Construct relative path from CWD: nested_repo/nested_file
+                f="${nested_repo%/}/$nested_file"
+                f="./${f#./}" # Ensure consistent ./ prefix
+                
+                filename=$(basename "$f")
+                
+                # IGNORE CHECK (Global config only, since it bypassed main gitignore)
+                 skip=false
+                 if (( ${#ignore_files[@]} > 0 )); then
+                   for pat in "${ignore_files[@]}"; do
+                     if [[ "$filename" == $pat ]]; then skip=true; break; fi
+                   done
+                 fi
+                 
+                 # Check Ignore Dirs
+                 if [[ "$skip" == false && "$NO_IGNORE" == false ]] && (( ${#ignore_dirs[@]} > 0 )); then
+                   clean_tgt="${tgt#./}"
+                   clean_tgt="${clean_tgt%/}"
+                   rel_path="$f"
+                   if [[ "$clean_tgt" != "." && "$f" == "$clean_tgt/"* ]]; then
+                     rel_path="${f#$clean_tgt/}"
+                   fi
+
+                   for d in "${ignore_dirs[@]}"; do
+                     if [[ "$rel_path" == *"/$d/"* || "$rel_path" == "$d/"* ]]; then
+                       skip=true
+                       break
+                     fi
+                   done
+                 fi
+                 
+                 [[ "$skip" == true ]] && continue
+                 [[ -f "$f" ]] || continue
+                 
+                 if is_text_file "$f"; then
+                   echo "$f" >> "$LISTFILE"
+                   ((++count))
+                   if (( count % 10 == 0 )); then
+                     printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "$f" >&2
+                   fi
+                 fi
+             done < <(git -C "$nested_repo" ls-files --cached --others --exclude-standard)
+           done
+        fi
+      fi
+    fi
+
+    while IFS= read -r line; do
+       if [[ "$is_nested" == true ]]; then
+         # Prefix with the target directory to make it relative to CWD
+         # Ensure clean path joining
+         f="${tgt%/}/$line"
+       else
+         f="$line"
+       fi
+       
        filename=$(basename "$f")
        skip=false
        if (( ${#ignore_files[@]} > 0 )); then
@@ -904,18 +1274,41 @@ if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]] && (( ${#dir_targets[@]} > 0
            if [[ "$filename" == $pat ]]; then skip=true; break; fi
          done
        fi
+       
+       if [[ "$skip" == false && "$NO_IGNORE" == false ]] && (( ${#ignore_dirs[@]} > 0 )); then
+         # Calculate path relative to the target directory
+         # This ensures that if we explicitly targeted an ignored directory (e.g. 'dist'),
+         # we don't immediately filter out its contents.
+         
+         clean_tgt="${tgt#./}"
+         clean_tgt="${clean_tgt%/}"
+         rel_path="$f"
+         
+         if [[ "$clean_tgt" != "." && "$f" == "$clean_tgt/"* ]]; then
+           rel_path="${f#$clean_tgt/}"
+         fi
+
+         for d in "${ignore_dirs[@]}"; do
+           # Check if the relative path contains the ignored directory
+           if [[ "$rel_path" == *"/$d/"* || "$rel_path" == "$d/"* ]]; then
+             skip=true
+             break
+           fi
+         done
+       fi
+       
        [[ "$skip" == true ]] && continue
        
        [[ -f "$f" ]] || continue
        
        if is_text_file "$f"; then
          echo "$f" >> "$LISTFILE"
-         ((count++))
+         ((++count))
          if (( count % 10 == 0 )); then
            printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "$f" >&2
          fi
        fi
-    done < <(git ls-files --cached --others --exclude-standard "$tgt")
+    done < <("${git_cmd[@]}")
   done
 elif (( ${#dir_targets[@]} > 0 )); then
   # FALLBACK MODE (FIND)
@@ -940,7 +1333,7 @@ elif (( ${#dir_targets[@]} > 0 )); then
         
         if is_text_file "$f"; then
           echo "${f#./}" >> "$LISTFILE"
-          ((count++))
+          ((++count))
           if (( count % 10 == 0 )); then
             printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "${f#./}" >&2
           fi
@@ -958,7 +1351,13 @@ fi
 # 13) PHASE 2: PREVIEW & ANALYSIS
 total_bytes=0
 if [[ -s "$LISTFILE" ]]; then
-  total_bytes=$(cat "$LISTFILE" | tr '\n' '\0' | xargs -0 stat -f %z 2>/dev/null | awk '{s+=$1} END {print s+0}' || echo 0)
+  # Sum file sizes using cross-platform stat
+  while IFS= read -r f; do
+    size=$(get_file_size "./$f")
+    # Ensure size is numeric (default to 0 if not)
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+    total_bytes=$((total_bytes + size))
+  done < "$LISTFILE"
 fi
 
 total_bytes=$((total_bytes + (count * 30)))
@@ -972,9 +1371,11 @@ printf "\n${BOLD}Files to Copy:${RESET}\n" >&2
 if [[ "$NO_IGNORE" == true ]]; then
   printf "  ${CLR_WARN}⚠️  Filters DISABLED (--no-ignore)${RESET}\n" >&2
 elif [[ "$IS_GIT" == true ]]; then
-  printf "  ${CLR_GIT}Excluding files in .gitignore and %s${RESET}\n" "$CONFIG" >&2
+  printf "  ${CLR_GIT}Excluding files in both .gitignore and %s${RESET}\n" "$CONFIG" >&2
+elif [[ "$HAS_GIT" == false ]]; then
+  printf "  ${CLR_WARN}git not installed, only excluding files in %s${RESET}\n" "$CONFIG" >&2
 else
-  printf "  ${CLR_WARN}No .gitignore found, excluding files in %s${RESET}\n" "$CONFIG" >&2
+  printf "  ${CLR_WARN}Not a git repo, only excluding files in %s${RESET}\n" "$CONFIG" >&2
 fi
 
 print_tree "$LISTFILE" >&2
@@ -1009,7 +1410,29 @@ while IFS= read -r rel_path; do
   fi
 done < "$LISTFILE"
 
-pbcopy < "$TMPFILE"
+# Use eval to handle multi-word clipboard commands (e.g., "xclip -selection clipboard")
+# This is safe because CLIPBOARD_CMD is set internally, not from user input
+if ! eval "$CLIPBOARD_CMD" < "$TMPFILE" 2>/dev/null; then
+  printf "\n${CLR_ERROR}✗ Clipboard copy failed!${RESET}\n" >&2
+  printf "${DIM}The clipboard tool '${CLIPBOARD_CMD%% *}' could not copy the content.${RESET}\n" >&2
+  
+  # Provide platform-specific guidance
+  case "$OS_TYPE" in
+    linux)
+      if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+        printf "${CLR_WARN}You appear to be on Wayland. Install wl-clipboard:${RESET}\n" >&2
+        printf "  sudo apt install wl-clipboard  ${DIM}# Ubuntu/Debian${RESET}\n" >&2
+      else
+        printf "${CLR_WARN}Try installing xclip:${RESET}\n" >&2
+        printf "  sudo apt install xclip  ${DIM}# Ubuntu/Debian${RESET}\n" >&2
+      fi
+      ;;
+  esac
+  
+  printf "\n${DIM}Alternatively, use --print to output to terminal:${RESET}\n" >&2
+  printf "  catclip --print > output.txt\n" >&2
+  exit 1
+fi
 printf "\n${CLR_SUCCESS}✔${RESET} ${BOLD}Copied to clipboard!${RESET}\n" >&2
 
 if [[ "$PRINT_CONTENT" == true ]]; then
