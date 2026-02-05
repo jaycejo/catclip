@@ -5,6 +5,10 @@ set -euo pipefail
 # install.sh — Interactive installer for catclip
 # ------------------------------------------------------------------------------
 
+if [[ -t 1 && "${TERM:-}" != "dumb" ]]; then
+  clear
+fi
+
 # Colors for UX
 RESET=$'\033[0m'
 BOLD=$'\033[1m'
@@ -60,7 +64,6 @@ HAS_LOCAL_CONFIG=true
 # ------------------------------------------------------------------------------
 # 4) Intro
 # ------------------------------------------------------------------------------
-clear
 echo "${BOLD}Installing catclip...${RESET}"
 echo
 
@@ -85,6 +88,10 @@ if [[ "$HAS_LOCAL_CONFIG" == true ]]; then
   if [[ -n "$INITIAL_ERR" ]]; then
     echo "${RED}❌ The source ignore.yaml is currently corrupt!${RESET}"
     echo "Error: $INITIAL_ERR"
+    if [[ ! -t 0 ]]; then
+      echo "Non-interactive shell; cannot prompt to fix. Aborting."
+      exit 1
+    fi
     read -r -p "Fix it now? [Y/n] " fix_init
     [[ "$fix_init" =~ ^[Nn]$ ]] && { echo "Aborting."; exit 1; }
     
@@ -101,9 +108,13 @@ if [[ "$HAS_LOCAL_CONFIG" == true ]]; then
 
   # Optional Edit
   echo "${YELLOW}Would you like to customize the 'ignore.yaml' template?${RESET}"
-  echo "The default template is optimized for Javascript, Java, and Python."
-  echo "If you work with other languages, we recommend customizing it now."
-  read -r -p "Open in editor? [y/N] " open_editor
+echo "The default template is optimized for common web and backend projects."
+echo "If you work with other languages, we recommend customizing it now."
+  if [[ ! -t 0 ]]; then
+    open_editor="n"
+  else
+    read -r -p "Open in editor? [y/N] " open_editor
+  fi
   if [[ "$open_editor" =~ ^[Yy]$ ]]; then
     EDITOR="${EDITOR:-$(command -v nano || command -v vi)}"
     while true; do
@@ -184,8 +195,24 @@ if [[ "$HAS_CLIPBOARD" == false ]]; then
       ;;
   esac
   echo
+  if [[ ! -t 0 ]]; then
+    echo "Non-interactive shell; cannot prompt. Aborting."
+    exit 1
+  fi
   read -r -p "Continue anyway? [y/N] " continue_install
   [[ ! "$continue_install" =~ ^[Yy]$ ]] && { echo "Aborting."; exit 1; }
+fi
+
+# ------------------------------------------------------------------------------
+# 6.5) Required Tools Check (basic)
+# ------------------------------------------------------------------------------
+if ! command -v awk &>/dev/null; then
+  echo "${RED}Error: 'awk' is required for install validation.${RESET}"
+  exit 1
+fi
+if ! command -v install &>/dev/null; then
+  echo "${RED}Error: 'install' command not found.${RESET}"
+  exit 1
 fi
 
 # ------------------------------------------------------------------------------
@@ -217,7 +244,11 @@ if [[ "$HAS_LOCAL_CONFIG" == true ]]; then
   if [[ -f "$DEST_CONFIG" ]]; then
     echo
     echo "${YELLOW}⚠️  Existing config found at $DEST_CONFIG${RESET}"
-    read -r -p "Replace with the new template? [y/N] " response
+    if [[ ! -t 0 ]]; then
+      response="n"
+    else
+      read -r -p "Replace with the new template? [y/N] " response
+    fi
     if [[ "$response" =~ ^[Yy]$ ]]; then
       COPY_ACTION="replace"
     fi
@@ -248,6 +279,11 @@ fi
 
 echo
 echo "${GREEN}${BOLD}Done! 🎉${RESET}"
+echo "  Binary: ${CYAN}$BIN_DIR/catclip${RESET}"
+echo "  Config: ${CYAN}$DEST_CONFIG${RESET}"
+if [[ ! -t 0 ]]; then
+  exit 0
+fi
 read -r -p "Show the help menu now? [y/N] " show_help
 if [[ "$show_help" =~ ^[Yy]$ ]]; then
     # Run using the absolute path to ensure it works even if PATH isn't updated

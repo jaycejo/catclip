@@ -80,13 +80,13 @@ detect_clipboard_cmd() {
       fi
       ;;
   esac
-  
+
   # Linux: detect display server and use appropriate tool
   local is_wayland=false
   if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
     is_wayland=true
   fi
-  
+
   if [[ "$is_wayland" == true ]]; then
     # Wayland: prefer wl-copy, fall back to xclip/xsel (via XWayland)
     if command -v wl-copy &>/dev/null; then
@@ -109,17 +109,18 @@ detect_clipboard_cmd() {
       return 0
     fi
   fi
-  
+
   return 1
 }
 
-CLIPBOARD_CMD=""
-if ! CLIPBOARD_CMD="$(detect_clipboard_cmd)"; then
+CLIPBOARD_CMD=()
+CLIPBOARD_CMD_STR=""
+if ! CLIPBOARD_CMD_STR="$(detect_clipboard_cmd)"; then
   echo "Error: No clipboard tool found." >&2
   case "$OS_TYPE" in
     macos) echo "  Install Xcode command line tools or ensure pbcopy is in PATH." >&2 ;;
     wsl)   echo "  Ensure clip.exe is available, or install xclip." >&2 ;;
-    linux) 
+    linux)
            # Detect display server to recommend the right tool
            if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
              echo "  Wayland detected. Install wl-clipboard:" >&2
@@ -135,6 +136,7 @@ if ! CLIPBOARD_CMD="$(detect_clipboard_cmd)"; then
   esac
   exit 1
 fi
+read -r -a CLIPBOARD_CMD <<< "$CLIPBOARD_CMD_STR"
 
 # 2) COLORS & THEME
 # ANSI escape codes. Semantic naming (CLR_ERROR vs RED) for self-documenting code.
@@ -154,6 +156,8 @@ CLR_DIR=$'\033[1;34m'
 CLR_LABEL=$'\033[90m'
 CLR_VALUE=$'\033[1m'
 CLR_TREE=$'\033[90m'
+CLR_SYMLINK=$'\033[95m'
+CLR_SYMLINK_TGT=$'\033[36m'
 CLR_PROMPT=$'\033[36m'
 CLR_GIT=$'\033[35m'
 
@@ -171,13 +175,13 @@ ignore_dirs:
   - .git
   - .svn
   - .hg
-  
+
   # IDEs & Editors
   - .idea
   - .vscode
   - .cursor
   - .history
-  
+
   # JavaScript / Node
   - node_modules
   - bower_components
@@ -186,7 +190,7 @@ ignore_dirs:
   - .npm
   - .yarn
   - .pnpm-store
-  
+
   # Python
   - __pycache__
   - venv
@@ -196,7 +200,7 @@ ignore_dirs:
   - .mypy_cache
   - .tox
   - htmlcov
-  
+
   # Java / Build
   - target
   - build
@@ -205,13 +209,13 @@ ignore_dirs:
   - bin
   - obj
   - .gradle
-  
+
   # Web Frameworks
   - .next
   - .nuxt
   - .serverless
   - .turbo
-  
+
   # Test directories
   - test
   - tests
@@ -235,7 +239,7 @@ ignore_files:
   - composer.lock
   - Cargo.lock
   - go.sum
-  
+
   # Secrets (CRITICAL - Never leak)
   - .env
   - .env.local
@@ -265,6 +269,10 @@ if [[ ! -f "$CONFIG" ]]; then
   printf "\n%s\n" "${CLR_WARN}Config Not Found: ${BOLD}$CONFIG${RESET}" >&2
   printf "%s\n" "${DIM}No ignore configuration exists.${RESET}" >&2
   printf "\n${CLR_WARN}Would you like to create default configuration? [Y/n]${RESET} " >&2
+  if [[ ! -r /dev/tty ]]; then
+    printf "%s\n" "${CLR_ERROR}Error: Cannot prompt for config creation (non-interactive shell).${RESET}" >&2
+    exit 1
+  fi
   read -r -n 1 response < /dev/tty
   echo
   if [[ "$response" =~ ^[Nn]$ ]]; then
@@ -280,10 +288,18 @@ fi
 TMPFILE=""
 LISTFILE=""
 UTF16_LIST=""
+SYMLINKS_FILE=""
+TREEFILE=""
+DEDUPFILE=""
+SYMLINKS_SORTED=""
 cleanup() {
   [[ -n "$TMPFILE" && -f "$TMPFILE" ]] && rm -f "$TMPFILE"
   [[ -n "$LISTFILE" && -f "$LISTFILE" ]] && rm -f "$LISTFILE"
   [[ -n "$UTF16_LIST" && -f "$UTF16_LIST" ]] && rm -f "$UTF16_LIST"
+  [[ -n "$SYMLINKS_FILE" && -f "$SYMLINKS_FILE" ]] && rm -f "$SYMLINKS_FILE"
+  [[ -n "$TREEFILE" && -f "$TREEFILE" ]] && rm -f "$TREEFILE"
+  [[ -n "$DEDUPFILE" && -f "$DEDUPFILE" ]] && rm -f "$DEDUPFILE"
+  [[ -n "$SYMLINKS_SORTED" && -f "$SYMLINKS_SORTED" ]] && rm -f "$SYMLINKS_SORTED"
   : # Ensure trap returns 0
 }
 trap cleanup EXIT
@@ -311,14 +327,79 @@ get_file_size() {
   echo "${size:-0}"
 }
 
+resolve_symlink_target() {
+  local link="$1"
+  local link_dir target abs_target
+  target=$(readlink "$link" 2>/dev/null || true)
+  [[ -z "$target" ]] && return 1
+  link_dir=$(cd "$(dirname "$link")" && pwd -P)
+  if [[ "$target" == /* ]]; then
+    abs_target="$target"
+  else
+    abs_target="$link_dir/$target"
+  fi
+  if [[ -e "$abs_target" || -L "$abs_target" ]]; then
+    abs_target=$(cd "$(dirname "$abs_target")" 2>/dev/null && pwd -P)/"$(basename "$abs_target")"
+  fi
+  printf "%s\n" "$abs_target"
+  return 0
+}
+
+record_symlink() {
+  local link_path="$1"
+  local link_display="${link_path#./}"
+  local abs_target rel_target
+  abs_target=$(resolve_symlink_target "$link_path" || true)
+  if [[ -n "$abs_target" && "$abs_target" == "$ROOT_DIR" ]]; then
+    rel_target="./"
+  elif [[ -n "$abs_target" && "$abs_target" == "$ROOT_DIR/"* ]]; then
+    rel_target="./${abs_target#$ROOT_DIR/}"
+  else
+    rel_target="(outside repo)"
+  fi
+  printf "%s|%s\n" "$link_display" "$rel_target" >> "$SYMLINKS_FILE"
+}
+
 print_tree() {
   local list_file="$1"
-  sort "$list_file" | awk -v dir_col="$CLR_DIR" -v reset="$RESET" -v tree_col="$CLR_TREE" -F/ '
+  local symlink_file="${2:-}"
+  if [[ -n "$symlink_file" && -s "$symlink_file" ]]; then
+    sort "$list_file" | awk -v dir_col="$CLR_DIR" -v reset="$RESET" -v tree_col="$CLR_TREE" \
+      -v sym_col="$CLR_SYMLINK" -v sym_tgt_col="$CLR_SYMLINK_TGT" -F/ '
+    NR==FNR {
+      split($0, parts, "|");
+      if (parts[1] != "") sym[parts[1]] = parts[2];
+      next
+    }
+    {
+      full = $1;
+      for (i = 2; i <= NF; i++) full = full "/" $i;
+      for (i=1; i<NF; i++) {
+        if ($i != last[i]) {
+          for (j=1; j<i; j++) printf tree_col "│   " reset
+          if (i == 1) printf ""
+          else printf tree_col "├── " reset
+          print dir_col $i "/" reset
+          last[i] = $i
+          for (k=i+1; k<=20; k++) delete last[k]
+        }
+      }
+      for (j=1; j<NF; j++) printf tree_col "│   " reset
+      printf tree_col "├── " reset
+      if (full in sym) {
+        print sym_col "[SYMLINK] ./" full " -> " sym_tgt_col sym[full] reset
+      } else {
+        print $NF
+      }
+      delete last[NF]
+    }' "$symlink_file" -
+  else
+    sort "$list_file" | awk -v dir_col="$CLR_DIR" -v reset="$RESET" -v tree_col="$CLR_TREE" -F/ '
   {
     for (i=1; i<NF; i++) {
       if ($i != last[i]) {
         for (j=1; j<i; j++) printf tree_col "│   " reset
-        if (i == 1) printf "" 
+        if (i == 1) printf ""
         else printf tree_col "├── " reset
         print dir_col $i "/" reset
         last[i] = $i
@@ -330,6 +411,7 @@ print_tree() {
     print $NF
     delete last[NF]
   }'
+  fi
 }
 
 print_help() {
@@ -350,7 +432,7 @@ ${BOLD}Targets:${RESET}
   ${BOLD}Fuzzy Directory Search:${RESET}
     ${CLR_SUCCESS}catclip authentication${RESET}          # Finds src/features/authentication (finds any directory matching 'authentication')
     ${CLR_SUCCESS}catclip components${RESET}              # Finds src/components, authentication/components, etc. (prompts if multiple)
-  
+
   ${BOLD}Chained Path Resolution:${RESET}
     ${CLR_SUCCESS}catclip authentication/components/LoginForm.tsx${RESET}  # Resolves 'authentication' → 'components' → copies 'LoginForm.tsx'
     ${CLR_SUCCESS}catclip authentication/api${RESET}                       # Resolves 'authentication' → 'api' → copies directory contents
@@ -358,11 +440,11 @@ ${BOLD}Targets:${RESET}
   ${BOLD}Full Relative Paths:${RESET}
     ${CLR_SUCCESS}catclip src/components/ui/Button.tsx${RESET}    # Fast. Use Tab completion from root (src/[TAB]/[TAB]...)
     ${CLR_SUCCESS}catclip src/config/constants.ts${RESET}         # Precise. Avoids ambiguity for common filenames
-  
+
   ${BOLD}Files in Current Directory:${RESET}
     ${CLR_SUCCESS}catclip Dockerfile${RESET}              # File in current working directory
     ${CLR_SUCCESS}catclip vite.config.js tsconfig.json${RESET}  # Multiple files
-  
+
   ${BOLD}Mixed Arguments:${RESET}
     ${CLR_SUCCESS}catclip README.md src/features/todos${RESET}
     # → Copies 'README.md' + entire 'todos' feature directory
@@ -376,7 +458,7 @@ ${BOLD}Options:${RESET}
 
   ${CLR_SUCCESS}--no-ignore${RESET}
       ${BOLD}Temporarily${RESET} bypass all ignore rules for this copy only.
-      
+
       ${DIM}catclip --no-ignore dist${RESET}
       ${DIM}catclip --no-ignore .env.local${RESET}
 
@@ -389,16 +471,19 @@ ${BOLD}Options:${RESET}
   ${CLR_SUCCESS}--list-ignores${RESET}
       Show what files and directories are currently being ignored.
 
+  ${CLR_SUCCESS}--no-tree${RESET}
+      Skip tree rendering for faster output on large file sets.
+
   ${CLR_SUCCESS}--ignore [OPERATIONS]${RESET}
       Permanently modify your ignore list.
-      
+
       ${BOLD}Add/remove files:${RESET}  +'pattern'  -'pattern'
       ${BOLD}Add/remove dirs:${RESET}   d+dirname  d-dirname
-      
+
       ${DIM}catclip --ignore +'*.log' -'secret.json' d+build d-src${RESET}
       # → Ignores .log files, un-ignores secret.json
       # → Ignores 'build' directory, un-ignores 'src' directory
-  
+
   ${CLR_SUCCESS}--reset-config${RESET}
       Restore the configuration file to factory defaults.
 
@@ -415,10 +500,15 @@ EOF
 # ------------------------------------------------------------------------------
 # Strategy: Check extensions first (fast), only use 'file --mime' as fallback.
 # This avoids spawning a subprocess for every file. 10x faster on large repos.
+
+# Cache mime results by extension to avoid repeated 'file' calls.
+mime_cache_exts=()
+mime_cache_vals=()
+
 is_text_file() {
   local f="$1"
   local ext="${f##*.}"
-  
+
   # ----------------------------------------------------------------------------
   # TIER 1: HARD BLOCKS (Return 1)
   # ----------------------------------------------------------------------------
@@ -452,7 +542,7 @@ db|sqlite|sqlite3|bin|dat|hex|dump|map|lockb)
       return 1
       ;;
   esac
-  
+
   # ----------------------------------------------------------------------------
   # TIER 2: TEXT ALLOW LIST (Return 0)
   # ----------------------------------------------------------------------------
@@ -489,27 +579,42 @@ vim|dart|vue|svelte|astro|tex|j2|ejs|hbs|mustache|liquid|pug|jade)
       return 0
       ;;
   esac
-  
+
   # ----------------------------------------------------------------------------
   # TIER 3: SLOW FALLBACK
   # ----------------------------------------------------------------------------
+  if [[ -n "$ext" ]]; then
+    for i in "${!mime_cache_exts[@]}"; do
+      if [[ "${mime_cache_exts[i]}" == "$ext" ]]; then
+        [[ "${mime_cache_vals[i]}" == "text" ]] && return 0
+        [[ "${mime_cache_vals[i]}" == "binary" ]] && return 1
+      fi
+    done
+  fi
+
   local mime
+  local result=1
+  local cache_kind=""
   mime=$(file -b --mime "$f" 2>/dev/null)
-  
-  [[ "$mime" =~ utf-16 ]] && return 1
-  [[ "$mime" =~ utf-32 ]] && return 1
-  [[ "$mime" =~ binary ]] && return 1
-  
-  [[ "$mime" == text/* ]] && return 0
-  [[ "$mime" =~ application/json ]] && return 0
-  [[ "$mime" =~ application/xml ]] && return 0
-  [[ "$mime" =~ application/javascript ]] && return 0
-  [[ "$mime" =~ application/x-sh ]] && return 0
-  [[ "$mime" =~ application/x-yaml ]] && return 0
-  
-  [[ ! -s "$f" ]] && return 0
-  
-  return 1
+
+  if [[ "$mime" =~ utf-16 ]] || [[ "$mime" =~ utf-32 ]] || [[ "$mime" =~ binary ]]; then
+    result=1
+    cache_kind="binary"
+  elif [[ "$mime" == text/* ]] || [[ "$mime" =~ application/json ]] || [[ "$mime" =~ application/xml ]] || \
+       [[ "$mime" =~ application/javascript ]] || [[ "$mime" =~ application/x-sh ]] || [[ "$mime" =~ application/x-yaml ]]; then
+    result=0
+    cache_kind="text"
+  elif [[ ! -s "$f" ]]; then
+    result=0
+    cache_kind="text"
+  fi
+
+  if [[ -n "$cache_kind" && -n "$ext" ]]; then
+    mime_cache_exts+=( "$ext" )
+    mime_cache_vals+=( "$cache_kind" )
+  fi
+
+  return "$result"
 }
 
 # ------------------------------------------------------------------------------
@@ -532,10 +637,10 @@ fuzzy_search_dir() {
   local search_name="$1"
   local base_dir="${2:-.}"  # Default to current directory if not specified
   local found=()
-  
+
   local search_prune_opts=()
   if [[ "$NO_IGNORE" == false ]] && (( ${#ignore_dirs[@]} > 0 )); then
-    for d in "${ignore_dirs[@]}"; do 
+    for d in "${ignore_dirs[@]}"; do
       search_prune_opts+=( -name "$d" -prune -o )
     done
   fi
@@ -546,15 +651,15 @@ fuzzy_search_dir() {
   fi
   find_cmd_opts+=( -type d -name "*${search_name}*" -print0 )
 
-  while IFS= read -r -d '' d; do 
+  while IFS= read -r -d '' d; do
     if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]]; then
-      if git check-ignore -q "$d" 2>/dev/null; then 
+      if git check-ignore -q "$d" 2>/dev/null; then
         continue
       fi
     fi
     found+=( "$d" )
   done < <(find "$base_dir" "${find_cmd_opts[@]}" 2>/dev/null)
-  
+
   if (( ${#found[@]} == 0 )); then
     return 1
   elif (( ${#found[@]} == 1 )); then
@@ -564,7 +669,7 @@ fuzzy_search_dir() {
     local context_msg="'$search_name'"
     [[ "$base_dir" != "." ]] && context_msg="'$search_name' in ${CLR_DIR}$base_dir${RESET}"
     printf "%s\n" "${BOLD}Multiple matches for $context_msg:${RESET}" >&2
-    for i in "${!found[@]}"; do 
+    for i in "${!found[@]}"; do
       printf "  ${BOLD}%2d)${RESET} ${CLR_DIR}%s${RESET}\n" $((i+1)) "${found[i]}" >&2
     done
     read -rp "Choose [1-${#found[@]}]: " c
@@ -585,10 +690,10 @@ resolve_chained_path() {
   local path_segments="$1"
   local current_base="."
   local segments=()
-  
+
   # Split path by /
   IFS='/' read -ra segments <<< "$path_segments"
-  
+
   for segment in "${segments[@]}"; do
     # First check if exact subdirectory exists
     if [[ -d "$current_base/$segment" ]]; then
@@ -600,30 +705,42 @@ resolve_chained_path() {
       else
         local ret=$?
         if (( ret == 2 )); then exit 2; fi
-        
+
         printf "%s\n" "${CLR_ERROR}Error: No directory matching '$segment' found in $current_base${RESET}" >&2
         return 1
       fi
     fi
   done
-  
+
   echo "$current_base"
   return 0
 }
 
 check_file_ignore() {
   local filename="$1"
-  
+
   if [[ "$NO_IGNORE" == true ]]; then
     return 1
   fi
-  
+
   for pat in "${ignore_files[@]:-}"; do
-    if [[ "$filename" == $pat ]]; then
-      return 0
-    fi
+    if [[ "$filename" == $pat ]]; then return 0; fi
   done
-  
+
+  return 1
+}
+
+path_has_ignored_dir() {
+  local rel_path="$1"
+
+  if [[ "$NO_IGNORE" == true ]]; then
+    return 1
+  fi
+
+  for d in "${ignore_dirs[@]:-}"; do
+    if [[ "$rel_path" == *"/$d/"* || "$rel_path" == "$d/"* ]]; then return 0; fi
+  done
+
   return 1
 }
 
@@ -652,17 +769,17 @@ is_dir_ignored() {
   local dirname
   dirname=$(basename "$dirpath")
   IGNORE_REASON=""
-  
+
   if [[ "$NO_IGNORE" == true ]]; then
     return 1
   fi
-  
+
   # Check YAML config first
   if is_dir_ignored_yaml "$dirname"; then
     IGNORE_REASON="yaml"
     return 0
   fi
-  
+
   # Check git ignore if in git repo
   if [[ "$IS_GIT" == true ]]; then
     if git check-ignore -q "$dirpath" 2>/dev/null; then
@@ -670,7 +787,7 @@ is_dir_ignored() {
       return 0
     fi
   fi
-  
+
   return 1
 }
 
@@ -679,7 +796,7 @@ is_dir_ignored() {
 print_dir_ignore_msg() {
   local dir_name="$1"
   local msg_type="${2:-error}"
-  
+
   local prefix action suffix
   if [[ "$msg_type" == "warning" ]]; then
     prefix="${CLR_WARN}Warning:"
@@ -689,14 +806,14 @@ print_dir_ignore_msg() {
     action=""
     suffix="\n${DIM}Use --no-ignore to include it anyway.${RESET}"
   fi
-  
+
   if [[ "$IGNORE_REASON" == "yaml" ]]; then
     printf "%s Directory '%s' is in ignore list%s${RESET}" "$prefix" "$dir_name" "${action:+, $action}" >&2
   else
     printf "%s Directory '%s' is ignored by .gitignore%s${RESET}" "$prefix" "$dir_name" "${action:+, $action}" >&2
   fi
   echo >&2
-  
+
   [[ "$msg_type" == "error" ]] && printf "${DIM}Use --no-ignore to include it anyway.${RESET}\n" >&2
   return 0
 }
@@ -704,11 +821,11 @@ print_dir_ignore_msg() {
 extract_dir_components() {
   local path="$1"
   local dir_part="${path%/*}"
-  
+
   if [[ "$dir_part" == "$path" ]]; then
     return
   fi
-  
+
   IFS='/' read -ra components <<< "$dir_part"
   for comp in "${components[@]}"; do
     echo "$comp"
@@ -721,7 +838,7 @@ check_parent_ignores() {
   local path="$1"
   local current_dir
   current_dir=$(dirname "$path")
-  
+
   # 1. OPTIMIZATION: Check YAML ignores in loop (fast, pure Bash)
   while [[ "$current_dir" != "." && "$current_dir" != "/" && -n "$current_dir" ]]; do
     if is_dir_ignored_yaml "$(basename "$current_dir")"; then
@@ -731,14 +848,14 @@ check_parent_ignores() {
     fi
     current_dir=$(dirname "$current_dir")
   done
-  
+
   # 2. OPTIMIZATION: Check Git ignores ONCE on the full path (slow, spawns process)
   # git check-ignore handles recursive parent checks natively.
   if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]]; then
     # If the path matches a gitignore rule, we need to determine WHICH directory is ignored
     # to provide a helpful warning. We scan up the tree to find the culprit.
     if git check-ignore -q "$path" 2>/dev/null; then
-       
+
        local check_dir=$(dirname "$path")
        while [[ "$check_dir" != "." && "$check_dir" != "/" && -n "$check_dir" ]]; do
          if git check-ignore -q "$check_dir" 2>/dev/null; then
@@ -750,7 +867,7 @@ check_parent_ignores() {
        done
     fi
   fi
-  
+
   return 0
 }
 
@@ -761,6 +878,7 @@ LIST_IGNORES=false
 SHOW_HELP=false
 PRINT_CONTENT=false
 RESET_CONFIG=false
+NO_TREE=false
 IGNORE_OPS=()
 raw_inputs=()
 
@@ -771,6 +889,7 @@ while (( $# )); do
     --list-ignores) LIST_IGNORES=true;    shift ;;
     --print)        PRINT_CONTENT=true;   shift ;;
     --reset-config) RESET_CONFIG=true;    shift ;;
+    --no-tree)      NO_TREE=true;         shift ;;
     --help|-h)      SHOW_HELP=true;       shift ;;
     --ignore)
       shift
@@ -781,7 +900,7 @@ while (( $# )); do
       done
       ;;
     --) shift; raw_inputs+=( "$@" ); break ;;
-    --*) 
+    --*)
       printf "%s\n" "${CLR_ERROR}Error: Unknown option '$1'${RESET}" >&2
       printf "Try '${CLR_SUCCESS}catclip${RESET} --help' for available options.\n" >&2
       exit 1
@@ -841,6 +960,10 @@ if [[ "$parse_error" == true ]]; then
   printf "\n%s\n" "${CLR_ERROR}Config Corrupted in ${BOLD}$CONFIG${RESET}" >&2
   printf "%s\n" "${CLR_ERROR}➤ $error_msg${RESET}" >&2
   printf "\n${CLR_WARN}Would you like to reset to factory defaults? [y/N]${RESET} " >&2
+  if [[ ! -r /dev/tty ]]; then
+    printf "%s\n" "${CLR_ERROR}Error: Cannot prompt to reset config (non-interactive shell).${RESET}" >&2
+    exit 1
+  fi
   read -r -n 1 response < /dev/tty
   echo
   if [[ "$response" =~ ^[Yy]$ ]]; then
@@ -858,6 +981,10 @@ if (( ${#ignore_dirs[@]} == 0 && ${#ignore_files[@]} == 0 )); then
   printf "\n%s\n" "${CLR_WARN}Config Empty in ${BOLD}$CONFIG${RESET}" >&2
   printf "%s\n" "${DIM}No ignore rules defined. This may cause unexpected behavior.${RESET}" >&2
   printf "\n${CLR_WARN}Would you like to reset to factory defaults? [y/N]${RESET} " >&2
+  if [[ ! -r /dev/tty ]]; then
+    printf "%s\n" "${CLR_ERROR}Error: Cannot prompt to reset config (non-interactive shell).${RESET}" >&2
+    exit 1
+  fi
   read -r -n 1 response < /dev/tty
   echo
   if [[ "$response" =~ ^[Yy]$ ]]; then
@@ -870,6 +997,7 @@ if (( ${#ignore_dirs[@]} == 0 && ${#ignore_files[@]} == 0 )); then
 fi
 
 
+
 # 8) CONFIG UPDATE LOGIC
 if (( ${#IGNORE_OPS[@]} > 0 )); then
   printf "%s\n" "${BOLD}Updating ignore list in ${DIM}$CONFIG${RESET}" >&2
@@ -877,23 +1005,23 @@ if (( ${#IGNORE_OPS[@]} > 0 )); then
 
   for op in "${IGNORE_OPS[@]}"; do
     case "$op" in
-      d+*) 
+      d+*)
            dir_name="${op:2}"
            ignore_dirs+=( "$dir_name" )
            changes_log+=( "${CLR_SUCCESS}+${RESET} ${CLR_DIR}${dir_name}${RESET}" )
            ;;
-      d-*) 
+      d-*)
            new_dirs=()
            for d in "${ignore_dirs[@]}"; do [[ "$d" != "${op:2}" ]] && new_dirs+=("$d"); done
            ignore_dirs=("${new_dirs[@]}")
            changes_log+=( "${CLR_ERROR}-${RESET} ${CLR_DIR}${op:2}${RESET}" )
            ;;
-      +*)  
+      +*)
            file_pattern="${op:1}"
            ignore_files+=( "$file_pattern" )
-           changes_log+=( "${CLR_SUCCESS}+${RESET} ${file_pattern}" ) 
+           changes_log+=( "${CLR_SUCCESS}+${RESET} ${file_pattern}" )
            ;;
-      -*)  
+      -*)
            new_files=()
            for f in "${ignore_files[@]}"; do [[ "$f" != "${op:1}" ]] && new_files+=("$f"); done
            ignore_files=("${new_files[@]}")
@@ -930,10 +1058,10 @@ fi
 if [[ "$LIST_IGNORES" == true ]]; then
   printf "%s\n" "${BOLD}Current Configuration${RESET}" >&2
   printf "${DIM}%s${RESET}\n" "$CONFIG" >&2
-  
+
   printf "\n${BOLD}Ignored Directories (YAML):${RESET}\n" >&2
   for d in "${ignore_dirs[@]:-}"; do printf "  ${CLR_ERROR}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d" >&2; done
-  
+
   printf "\n${BOLD}Ignored Files (YAML):${RESET}\n" >&2
   for f in "${ignore_files[@]:-}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f" >&2; done
 
@@ -947,7 +1075,7 @@ if [[ "$LIST_IGNORES" == true ]]; then
         printf "  ${CLR_GIT}•${RESET} %s\n" "$line" >&2
       done
     else
-      printf "\n${DIM}(No .gitignore found in project root)${RESET}\n" >&2  
+      printf "\n${DIM}(No .gitignore found in project root)${RESET}\n" >&2
     fi
   fi
   exit 0
@@ -958,18 +1086,23 @@ fi
 
 IS_GIT=false
 if [[ "$HAS_GIT" == true ]] && git rev-parse --show-toplevel &>/dev/null 2>&1; then IS_GIT=true; fi
+ROOT_DIR=$(pwd -P)
+if [[ "$IS_GIT" == true ]]; then
+  git_root=$(git rev-parse --show-toplevel)
+  ROOT_DIR=$(cd "$git_root" && pwd -P)
+fi
 
 file_targets=()
 dir_targets=()
 
 for arg in "${raw_inputs[@]}"; do
-  
+
   if contains_parent_traversal "$arg"; then
     printf "%s\n" "${CLR_ERROR}Error: Cannot traverse above working directory: '$arg'${RESET}" >&2
     printf "${DIM}Hint: catclip must be run from project root and cannot access parent directories.${RESET}\n" >&2
     exit 1
   fi
-  
+
   # BRANCH 1: Single word (no slashes) - local file/dir or fuzzy search
   if ! has_slashes "$arg"; then
     if [[ -d "$arg" ]]; then
@@ -979,7 +1112,7 @@ for arg in "${raw_inputs[@]}"; do
         exit 1
       fi
       dir_targets+=( "./$arg" )
-      
+
       elif resolved_dir=$(fuzzy_search_dir "$arg"); then
       # Found matching directories via fuzzy search
       if is_dir_ignored "$resolved_dir"; then
@@ -988,7 +1121,7 @@ for arg in "${raw_inputs[@]}"; do
         exit 1
       fi
       dir_targets+=( "$resolved_dir" )
-      
+
     else
       # Check exit code of fuzzy search (it runs in subshell for command substitution)
       # But since we used 'elif', we lost the exit code? No, 'elif command' failure exit status is available?
@@ -996,7 +1129,7 @@ for arg in "${raw_inputs[@]}"; do
       # Bash behavior: if the condition failed, $? holds the return code.
       ret=$?
        if (( ret == 2 )); then exit 2; fi
-       
+
        if [[ -f "$arg" ]]; then
         # Local file exists (only match if no directory found)
         if check_file_ignore "$arg"; then
@@ -1005,7 +1138,7 @@ for arg in "${raw_inputs[@]}"; do
           exit 1
         fi
         file_targets+=( "./$arg" )
-      
+
       elif [[ "$arg" == *.* ]]; then
       # Looks like a filename but not found
       printf "%s\n" "${CLR_ERROR}Error: File '$arg' not found in working directory.${RESET}" >&2
@@ -1013,7 +1146,7 @@ for arg in "${raw_inputs[@]}"; do
       printf "  ${CLR_SUCCESS}directory/filename${RESET}       ${DIM}(fuzzy search directory first)${RESET}\n" >&2
       printf "  ${CLR_SUCCESS}full/path/to/file${RESET}        ${DIM}(relative path from root)${RESET}\n" >&2
       exit 1
-      
+
     else
       # No directory found, not a file
       printf "%s\n" "${CLR_ERROR}Error: No directory matching '$arg' found.${RESET}" >&2
@@ -1024,12 +1157,12 @@ for arg in "${raw_inputs[@]}"; do
       exit 1
     fi
     fi
-    
+
   # BRANCH 2: Has slashes - path resolution (exact or chained)
   else
     filename="${arg##*/}"
     dir_path="${arg%/*}"
-    
+
     # First check if exact path already exists
     if [[ -e "$arg" ]]; then
       # Exact path exists - use it directly
@@ -1039,16 +1172,16 @@ for arg in "${raw_inputs[@]}"; do
           printf "${DIM}Use --no-ignore to include it anyway.${RESET}\n" >&2
           exit 1
         fi
-        
+
         # Check if parent directory is ignored
         check_parent_ignores "$arg"
-        
+
         if ! is_text_file "$arg"; then
           printf "%s\n" "${CLR_ERROR}Error: File '$filename' is a binary file and cannot be copied.${RESET}" >&2
           exit 1
         fi
         file_targets+=( "$arg" )
-        
+
       elif [[ -d "$arg" ]]; then
         dirname_base=$(basename "$arg")
         if is_dir_ignored "$arg"; then
@@ -1056,15 +1189,15 @@ for arg in "${raw_inputs[@]}"; do
         fi
         dir_targets+=( "$arg" )
       fi
-      
+
     else
       # Path doesn't exist - use chained resolution
       if ! resolved_dir=$(resolve_chained_path "$dir_path"); then
         exit 1
       fi
-      
+
       full_path="$resolved_dir/$filename"
-      
+
       if [[ -d "$full_path" ]]; then
         if is_dir_ignored "$full_path"; then
           resolved_name=$(basename "$full_path")
@@ -1072,11 +1205,11 @@ for arg in "${raw_inputs[@]}"; do
           exit 1
         fi
         dir_targets+=( "$full_path" )
-        
+
       elif [[ -f "$full_path" ]]; then
         # Check if parent directory is ignored (using recursive check)
         check_parent_ignores "$full_path"
-        
+
         if ! is_text_file "$full_path"; then
           printf "%s\n" "${CLR_ERROR}Error: File '$filename' is a binary file and cannot be copied.${RESET}" >&2
           exit 1
@@ -1087,7 +1220,7 @@ for arg in "${raw_inputs[@]}"; do
           exit 1
         fi
         file_targets+=( "$full_path" )
-        
+
       else
         printf "%s\n" "${CLR_ERROR}Error: '$filename' not found in directory '$resolved_dir'${RESET}" >&2
         printf "${DIM}Searched in: $full_path${RESET}\n" >&2
@@ -1107,23 +1240,35 @@ find_opts=()
 if [[ "$NO_IGNORE" == false ]] && (( ${#ignore_dirs[@]} > 0 )); then
   for d in "${ignore_dirs[@]}"; do find_opts+=( -name "$d" -prune -o ); done
 fi
-find_opts+=( -type f )
+find_opts+=( \( -type f -o -type l \) )
 find_opts+=( -print0 )
 
 # 12) PHASE 1: DISCOVERY
 LISTFILE="$(mktemp)"
+SYMLINKS_FILE="$(mktemp)"
 count=0
+NESTED_FILE_COUNT=0
 
 printf "\n${BOLD}Discovering files...${RESET}\n\n" >&2
 
 # PHASE 1A: Process individual files
 if (( ${#file_targets[@]} > 0 )); then
   for f in "${file_targets[@]}"; do
+    if [[ ! -r "$f" ]]; then
+      printf "${CLR_WARN}Warning: Cannot read file '%s'. Skipping.${RESET}\n" "$f" >&2
+      continue
+    fi
+    if [[ -L "$f" ]]; then
+      record_symlink "$f"
+      continue
+    fi
     if is_text_file "$f"; then
       normalized="${f#./}"
       echo "$normalized" >> "$LISTFILE"
       ((++count))
+      if (( count % 100 == 0 )); then
       printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "$normalized" >&2
+      fi
     fi
   done
 fi
@@ -1132,179 +1277,159 @@ fi
 if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]] && (( ${#dir_targets[@]} > 0 )); then
   # GIT MODE
   # GIT MODE
+  abs_cwd=$(pwd -P)
   for tgt in "${dir_targets[@]}"; do
     # Check if this target belongs to a DIFFERENT git root (nested repo)
     # We resolve the absolute path to be sure
-    abs_tgt=$(cd "$tgt" && pwd)
+    abs_tgt=$(cd "$tgt" && pwd -P)
     tgt_git_root=$(git -C "$abs_tgt" rev-parse --show-toplevel 2>/dev/null || echo "")
-    
+
     # Calculate relation to current root
-    current_git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-    
+    current_git_root="$ROOT_DIR"
+
     # Defaults for standard intra-repo behavior
     git_cmd=(git ls-files --cached --others --exclude-standard "$tgt")
     is_nested=false
-    
+    nested_prefix=""
+    rel_tgt="."
+
+    clean_tgt="${tgt#./}"
+    clean_tgt="${clean_tgt%/}"
+
     if [[ -n "$tgt_git_root" && "$tgt_git_root" != "$current_git_root" ]]; then
       # NESTED REPO DETECTED
       is_nested=true
-      
-      # Run ls-files INSIDE the nested repo.
-      # git -C "$tgt" ls-files lists files relative to "$tgt".
-      # We will prefix "$tgt/" to each line in the loop below to make it relative to CWD.
-      git_cmd=(git -C "$tgt" ls-files --cached --others --exclude-standard)
-    else
-      # STANDARD REPO: Check for HIDDEN nested repos inside this target
-      # e.g. running 'catclip .' where 'example-project' is a subdir with .git
-      
-      nested_repos=()
-      while IFS= read -r -d '' git_dir; do
-        repo_root=$(dirname "$git_dir")
-        
-        # Resolve absolute path for comparison
-        abs_repo_root=$(cd "$repo_root" && pwd)
-        
-        # Skip if it's the main repo's root
-        [[ "$abs_repo_root" == "$current_git_root" ]] && continue
-        
-        # Skip if it matches the current git root (redundant check?)
-        # current_git_root is already absolute.
-        
-        # Verify it's actually a directory we can reach
-        if [[ -d "$repo_root" ]]; then
-             nested_repos+=( "$repo_root" )
-        fi
-      done < <(find "$tgt" -name ".git" -type d -prune -print0 2>/dev/null)
-      
-      if (( ${#nested_repos[@]} > 0 )); then
-        plural="ies"
-        if (( ${#nested_repos[@]} == 1 )); then plural="y"; fi
-        
-        printf "\n${CLR_WARN}Found %d nested git repositor%s in ${BOLD}%s${RESET}:${RESET}\n" \
-          "${#nested_repos[@]}" "$plural" "${tgt}" >&2
-        
-        for repo in "${nested_repos[@]}"; do
-          printf "  ${CLR_GIT}•${RESET} %s\n" "${repo#./}" >&2
-        done
-        
-        include_nested=false
-        if [[ "$SKIP_CONFIRM" == true ]]; then
-           echo "${DIM}Auto-including nested repositories (--yes)...${RESET}" >&2
-           include_nested=true
-        else
-          printf "\n${CLR_PROMPT}Include nested repositories? [Y/n]${RESET} " >&2
-          read -r -n 1 response < /dev/tty
-          echo >&2
-          if [[ "$response" =~ ^[Yy]$ || -z "$response" ]]; then
-            include_nested=true
-          fi
-        fi
-        
-        if [[ "$include_nested" == true ]]; then
-           for nested_repo in "${nested_repos[@]}"; do
-             # Add the nested repo files effectively as if it was a target
-             # logic similar to the 'is_nested' block but inside this loop
-             
-             printf "${DIM}  └─ Processing: ${CLR_GIT}%s${RESET}\n" "${nested_repo#./}" >&2
-             
-             while IFS= read -r nested_file; do
-                # Determine absolute path of file to check textness/ignores
-                # nested_file is relative to nested_repo
-                
-                # Construct relative path from CWD: nested_repo/nested_file
-                f="${nested_repo%/}/$nested_file"
-                f="./${f#./}" # Ensure consistent ./ prefix
-                
-                filename=$(basename "$f")
-                
-                # IGNORE CHECK (Global config only, since it bypassed main gitignore)
-                 skip=false
-                 if (( ${#ignore_files[@]} > 0 )); then
-                   for pat in "${ignore_files[@]}"; do
-                     if [[ "$filename" == $pat ]]; then skip=true; break; fi
-                   done
-                 fi
-                 
-                 # Check Ignore Dirs
-                 if [[ "$skip" == false && "$NO_IGNORE" == false ]] && (( ${#ignore_dirs[@]} > 0 )); then
-                   clean_tgt="${tgt#./}"
-                   clean_tgt="${clean_tgt%/}"
-                   rel_path="$f"
-                   if [[ "$clean_tgt" != "." && "$f" == "$clean_tgt/"* ]]; then
-                     rel_path="${f#$clean_tgt/}"
-                   fi
 
-                   for d in "${ignore_dirs[@]}"; do
-                     if [[ "$rel_path" == *"/$d/"* || "$rel_path" == "$d/"* ]]; then
-                       skip=true
-                       break
-                     fi
-                   done
-                 fi
-                 
-                 [[ "$skip" == true ]] && continue
-                 [[ -f "$f" ]] || continue
-                 
-                 if is_text_file "$f"; then
-                   echo "$f" >> "$LISTFILE"
-                   ((++count))
-                   if (( count % 10 == 0 )); then
-                     printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "$f" >&2
-                   fi
-                 fi
-             done < <(git -C "$nested_repo" ls-files --cached --others --exclude-standard)
-           done
+      # Run ls-files at the nested repo root (paths are relative to that root).
+      git_cmd=(git -C "$tgt_git_root" ls-files --cached --others --exclude-standard)
+
+      # Map nested repo root to current working directory.
+      if [[ "$tgt_git_root" == "$abs_cwd" ]]; then
+        nested_prefix="."
+      elif [[ "$tgt_git_root" == "$abs_cwd/"* ]]; then
+        nested_prefix="${tgt_git_root#$abs_cwd/}"
+      else
+        nested_prefix="$tgt_git_root"
+      fi
+
+      # Limit files to the requested subdir inside the nested repo.
+      if [[ "$abs_tgt" == "$tgt_git_root" ]]; then
+        rel_tgt="."
+      elif [[ "$abs_tgt" == "$tgt_git_root/"* ]]; then
+        rel_tgt="${abs_tgt#$tgt_git_root/}"
+      fi
+    else
+      # STANDARD REPO: auto-include nested git repos only when scanning repo root
+      if [[ "$clean_tgt" == "." && "$abs_tgt" == "$current_git_root" ]]; then
+        nested_repos=()
+        while IFS= read -r -d '' git_dir; do
+          repo_root=$(dirname "$git_dir")
+          abs_repo_root=$(cd "$repo_root" && pwd -P)
+          [[ "$abs_repo_root" == "$current_git_root" ]] && continue
+          if [[ -d "$repo_root" ]]; then
+            nested_repos+=( "$repo_root" )
+          fi
+        done < <(find "$tgt" -name ".git" -type d -prune -print0 2>/dev/null)
+
+        if (( ${#nested_repos[@]} > 0 )); then
+          plural="ies"
+          if (( ${#nested_repos[@]} == 1 )); then plural="y"; fi
+          printf "\n${CLR_WARN}Found %d nested git repositor%s in ${BOLD}%s${RESET} (auto-including):${RESET}\n" \
+            "${#nested_repos[@]}" "$plural" "${tgt}" >&2
+          for repo in "${nested_repos[@]}"; do
+            printf "  ${CLR_GIT}•${RESET} %s\n" "${repo#./}" >&2
+          done
+
+          for nested_repo in "${nested_repos[@]}"; do
+            while IFS= read -r nested_file; do
+              f="${nested_repo%/}/$nested_file"
+              f="./${f#./}"
+
+              filename="${f##*/}"
+              skip=false
+              if check_file_ignore "$filename"; then skip=true; fi
+
+              if [[ "$skip" == false && "$NO_IGNORE" == false ]] && (( ${#ignore_dirs[@]} > 0 )); then
+                rel_path="$f"
+                if [[ "$clean_tgt" != "." && "$f" == "$clean_tgt/"* ]]; then
+                  rel_path="${f#$clean_tgt/}"
+                fi
+                if path_has_ignored_dir "$rel_path"; then skip=true; fi
+              fi
+
+              [[ "$skip" == true ]] && continue
+              if [[ -L "$f" ]]; then
+                record_symlink "$f"
+                continue
+              fi
+              [[ -f "$f" ]] || continue
+              if [[ ! -r "$f" ]]; then
+                printf "${CLR_WARN}Warning: Cannot read file '%s'. Skipping.${RESET}\n" "$f" >&2
+                continue
+              fi
+              if is_text_file "$f"; then
+                echo "$f" >> "$LISTFILE"
+                ((++count))
+                ((++NESTED_FILE_COUNT))
+                if (( count % 100 == 0 )); then
+                  printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "$f" >&2
+                fi
+              fi
+            done < <(git -C "$nested_repo" ls-files --cached --others --exclude-standard)
+          done
         fi
       fi
     fi
 
     while IFS= read -r line; do
        if [[ "$is_nested" == true ]]; then
-         # Prefix with the target directory to make it relative to CWD
-         # Ensure clean path joining
-         f="${tgt%/}/$line"
+         if [[ "$rel_tgt" != "." && "$line" != "$rel_tgt/"* ]]; then
+           continue
+         fi
+         if [[ "$nested_prefix" == "." ]]; then
+           f="$line"
+         else
+           f="${nested_prefix%/}/$line"
+         fi
        else
          f="$line"
        fi
-       
-       filename=$(basename "$f")
+
+       filename="${f##*/}"
        skip=false
-       if (( ${#ignore_files[@]} > 0 )); then
-         for pat in "${ignore_files[@]}"; do
-           if [[ "$filename" == $pat ]]; then skip=true; break; fi
-         done
-       fi
-       
+       if check_file_ignore "$filename"; then skip=true; fi
+
        if [[ "$skip" == false && "$NO_IGNORE" == false ]] && (( ${#ignore_dirs[@]} > 0 )); then
          # Calculate path relative to the target directory
          # This ensures that if we explicitly targeted an ignored directory (e.g. 'dist'),
          # we don't immediately filter out its contents.
-         
-         clean_tgt="${tgt#./}"
-         clean_tgt="${clean_tgt%/}"
+
          rel_path="$f"
-         
+
          if [[ "$clean_tgt" != "." && "$f" == "$clean_tgt/"* ]]; then
            rel_path="${f#$clean_tgt/}"
          fi
 
-         for d in "${ignore_dirs[@]}"; do
-           # Check if the relative path contains the ignored directory
-           if [[ "$rel_path" == *"/$d/"* || "$rel_path" == "$d/"* ]]; then
-             skip=true
-             break
-           fi
-         done
+         if path_has_ignored_dir "$rel_path"; then skip=true; fi
        fi
-       
+
        [[ "$skip" == true ]] && continue
-       
+
+       if [[ -L "$f" ]]; then
+         record_symlink "$f"
+         continue
+       fi
+
        [[ -f "$f" ]] || continue
-       
+       if [[ ! -r "$f" ]]; then
+         printf "${CLR_WARN}Warning: Cannot read file '%s'. Skipping.${RESET}\n" "$f" >&2
+         continue
+       fi
+
        if is_text_file "$f"; then
          echo "$f" >> "$LISTFILE"
          ((++count))
-         if (( count % 10 == 0 )); then
+                   if (( count % 100 == 0 )); then
            printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "$f" >&2
          fi
        fi
@@ -1313,32 +1438,58 @@ if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]] && (( ${#dir_targets[@]} > 0
 elif (( ${#dir_targets[@]} > 0 )); then
   # FALLBACK MODE (FIND)
   for tgt in "${dir_targets[@]}"; do
-    files_to_process=()
     if (( ${#find_opts[@]} > 0 )); then
-      while IFS= read -r -d '' f; do files_to_process+=( "$f" ); done < <(find "$tgt" "${find_opts[@]}")
-    else
-      while IFS= read -r -d '' f; do files_to_process+=( "$f" ); done < <(find "$tgt" -type f -print0)
-    fi
-
-    if (( ${#files_to_process[@]} > 0 )); then
-      for f in "${files_to_process[@]}"; do
+      while IFS= read -r -d '' f; do
         if [[ "$NO_IGNORE" == false ]] && (( ${#ignore_files[@]} > 0 )); then
-          filename=$(basename "$f")
-          skip=false
-          for pat in "${ignore_files[@]}"; do
-             if [[ "$filename" == $pat ]]; then skip=true; break; fi
-          done
-          [[ "$skip" == true ]] && continue
+          filename="${f##*/}"
+          if check_file_ignore "$filename"; then
+            continue
+          fi
         fi
-        
+
+        if [[ -L "$f" ]]; then
+          record_symlink "$f"
+          continue
+        fi
+
+        if [[ ! -r "$f" ]]; then
+          printf "${CLR_WARN}Warning: Cannot read file '%s'. Skipping.${RESET}\n" "$f" >&2
+          continue
+        fi
         if is_text_file "$f"; then
           echo "${f#./}" >> "$LISTFILE"
           ((++count))
-          if (( count % 10 == 0 )); then
+          if (( count % 100 == 0 )); then
             printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "${f#./}" >&2
           fi
         fi
-      done
+      done < <(find "$tgt" "${find_opts[@]}")
+    else
+      while IFS= read -r -d '' f; do
+        if [[ "$NO_IGNORE" == false ]] && (( ${#ignore_files[@]} > 0 )); then
+          filename="${f##*/}"
+          if check_file_ignore "$filename"; then
+            continue
+          fi
+        fi
+
+        if [[ -L "$f" ]]; then
+          record_symlink "$f"
+          continue
+        fi
+
+        if [[ ! -r "$f" ]]; then
+          printf "${CLR_WARN}Warning: Cannot read file '%s'. Skipping.${RESET}\n" "$f" >&2
+          continue
+        fi
+        if is_text_file "$f"; then
+          echo "${f#./}" >> "$LISTFILE"
+          ((++count))
+          if (( count % 100 == 0 )); then
+            printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "${f#./}" >&2
+          fi
+        fi
+      done < <(find "$tgt" \( -type f -o -type l \) -print0)
     fi
   done
 fi
@@ -1348,16 +1499,32 @@ if [[ ! -s "$LISTFILE" ]]; then
   exit 1
 fi
 
+DEDUPFILE="$(mktemp)"
+awk '!seen[$0]++' "$LISTFILE" > "$DEDUPFILE"
+mv "$DEDUPFILE" "$LISTFILE"
+
 # 13) PHASE 2: PREVIEW & ANALYSIS
 total_bytes=0
 if [[ -s "$LISTFILE" ]]; then
-  # Sum file sizes using cross-platform stat
+  # Batch stat for speed; fall back to per-file if needed.
+  if [[ "$OS_TYPE" == "macos" ]]; then
+    total_bytes=$(tr '\n' '\0' < "$LISTFILE" \
+      | xargs -0 stat -f %z 2>/dev/null \
+      | awk '{s+=$1} END {print s+0}' || echo 0)
+  else
+    total_bytes=$(tr '\n' '\0' < "$LISTFILE" \
+      | xargs -0 stat -c %s 2>/dev/null \
+      | awk '{s+=$1} END {print s+0}' || echo 0)
+  fi
+
+  if [[ ! "$total_bytes" =~ ^[0-9]+$ ]]; then
+    total_bytes=0
   while IFS= read -r f; do
     size=$(get_file_size "./$f")
-    # Ensure size is numeric (default to 0 if not)
     [[ "$size" =~ ^[0-9]+$ ]] || size=0
     total_bytes=$((total_bytes + size))
   done < "$LISTFILE"
+  fi
 fi
 
 total_bytes=$((total_bytes + (count * 30)))
@@ -1378,8 +1545,21 @@ else
   printf "  ${CLR_WARN}Not a git repo, only excluding files in %s${RESET}\n" "$CONFIG" >&2
 fi
 
-print_tree "$LISTFILE" >&2
+if [[ "$NO_TREE" == false ]]; then
+  TREEFILE="$(mktemp)"
+  cat "$LISTFILE" > "$TREEFILE"
+  if [[ -s "$SYMLINKS_FILE" ]]; then
+    SYMLINKS_SORTED="$(mktemp)"
+    sort -u "$SYMLINKS_FILE" > "$SYMLINKS_SORTED"
+    cut -d'|' -f1 "$SYMLINKS_SORTED" >> "$TREEFILE"
+  fi
+  print_tree "$TREEFILE" "${SYMLINKS_SORTED:-$SYMLINKS_FILE}" >&2
+fi
 printf "\n" >&2
+
+if (( NESTED_FILE_COUNT > 0 )); then
+  printf "  ${CLR_GIT}Included %d files from nested git projects.${RESET}\n" "$NESTED_FILE_COUNT" >&2
+fi
 
 if (( est_tokens > TOKEN_WARN_LIMIT )); then
   printf "  ${CLR_WARN}⚠️  Warning: ~%d tokens. This may exceed the context window of some LLMs.%s\n" "$est_tokens" "${RESET}" >&2
@@ -1403,19 +1583,29 @@ fi
 # 15) PHASE 3: EXECUTION
 TMPFILE="$(mktemp)"
 
-while IFS= read -r rel_path; do
-  f="./$rel_path"
-  if [[ -f "$f" ]]; then
-    { echo "# File: $rel_path"; cat "$f"; echo ""; } >> "$TMPFILE"
-  fi
-done < "$LISTFILE"
+awk -v warn="$CLR_WARN" -v reset="$RESET" '
+  {
+    f = "./" $0
+    r = (getline line < f)
+    if (r < 0) {
+      printf "%sWarning: Cannot read file '\''%s'\''. Skipping.%s\n", warn, f, reset > "/dev/stderr"
+      next
+    }
+    print "# File: " $0
+    if (r > 0) {
+      print line
+      while ((getline line < f) > 0) print line
+    }
+    close(f)
+    print ""
+  }
+' "$LISTFILE" > "$TMPFILE"
 
-# Use eval to handle multi-word clipboard commands (e.g., "xclip -selection clipboard")
-# This is safe because CLIPBOARD_CMD is set internally, not from user input
-if ! eval "$CLIPBOARD_CMD" < "$TMPFILE" 2>/dev/null; then
+# Use array invocation for clipboard commands (e.g., "xclip -selection clipboard")
+if ! "${CLIPBOARD_CMD[@]}" < "$TMPFILE" 2>/dev/null; then
   printf "\n${CLR_ERROR}✗ Clipboard copy failed!${RESET}\n" >&2
-  printf "${DIM}The clipboard tool '${CLIPBOARD_CMD%% *}' could not copy the content.${RESET}\n" >&2
-  
+  printf "${DIM}The clipboard tool '${CLIPBOARD_CMD_STR%% *}' could not copy the content.${RESET}\n" >&2
+
   # Provide platform-specific guidance
   case "$OS_TYPE" in
     linux)
@@ -1428,7 +1618,7 @@ if ! eval "$CLIPBOARD_CMD" < "$TMPFILE" 2>/dev/null; then
       fi
       ;;
   esac
-  
+
   printf "\n${DIM}Alternatively, use --print to output to terminal:${RESET}\n" >&2
   printf "  catclip --print > output.txt\n" >&2
   exit 1
