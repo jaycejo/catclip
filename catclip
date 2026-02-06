@@ -113,29 +113,6 @@ detect_clipboard_cmd() {
   return 1
 }
 
-CLIPBOARD_CMD=""
-if ! CLIPBOARD_CMD="$(detect_clipboard_cmd)"; then
-  echo "Error: No clipboard tool found." >&2
-  case "$OS_TYPE" in
-    macos) echo "  Install Xcode command line tools or ensure pbcopy is in PATH." >&2 ;;
-    wsl)   echo "  Ensure clip.exe is available, or install xclip." >&2 ;;
-    linux) 
-           # Detect display server to recommend the right tool
-           if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-             echo "  Wayland detected. Install wl-clipboard:" >&2
-             echo "    Ubuntu/Debian: sudo apt install wl-clipboard" >&2
-             echo "    Fedora/RHEL:   sudo dnf install wl-clipboard" >&2
-             echo "    Arch:          sudo pacman -S wl-clipboard" >&2
-           else
-             echo "  X11 detected. Install xclip:" >&2
-             echo "    Ubuntu/Debian: sudo apt install xclip" >&2
-             echo "    Fedora/RHEL:   sudo dnf install xclip" >&2
-             echo "    Arch:          sudo pacman -S xclip" >&2
-           fi ;;
-  esac
-  exit 1
-fi
-
 # 2) COLORS & THEME
 # ANSI escape codes. Semantic naming (CLR_ERROR vs RED) for self-documenting code.
 RESET=$'\033[0m'
@@ -161,6 +138,16 @@ CLR_GIT=$'\033[35m'
 # XDG Base Directory spec: ~/.config/catclip/ignore.yaml
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/catclip"
 CONFIG="$CONFIG_DIR/ignore.yaml"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PREFIX_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SHARE_TEMPLATE="$PREFIX_DIR/share/catclip/ignore.yaml"
+VERSION="dev"
+if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
+  VERSION="$(tr -d ' \t\r\n' < "$SCRIPT_DIR/VERSION")"
+fi
+if [[ -n "${CATCLIP_VERSION:-}" ]]; then
+  VERSION="$CATCLIP_VERSION"
+fi
 
 # EMBEDDED DEFAULTS (The "Factory Reset" State)
 
@@ -269,8 +256,13 @@ if [[ ! -f "$CONFIG" ]]; then
     echo "${CLR_WARN}Continuing without ignore rules (all text files will be included)...${RESET}" >&2
   else
     mkdir -p "$CONFIG_DIR"
-    get_default_config > "$CONFIG"
-    echo "${CLR_SUCCESS}Default configuration created at ${BOLD}$CONFIG${RESET}" >&2
+    if [[ -f "$SHARE_TEMPLATE" ]]; then
+      cp "$SHARE_TEMPLATE" "$CONFIG"
+      echo "${CLR_SUCCESS}Default configuration copied from ${BOLD}$SHARE_TEMPLATE${RESET}" >&2
+    else
+      get_default_config > "$CONFIG"
+      echo "${CLR_SUCCESS}Default configuration created at ${BOLD}$CONFIG${RESET}" >&2
+    fi
   fi
 fi
 
@@ -332,7 +324,7 @@ print_tree() {
 
 print_help() {
   cat <<EOF
-${BOLD}catclip${RESET} - Copy code context for AI prompts
+${BOLD}catclip${RESET} ${DIM}v${VERSION}${RESET} - Copy code context for AI prompts
 
   Recursively copies code files to your clipboard with a visual tree preview.
   Automatically filters out secrets, binaries, and build artifacts.
@@ -371,6 +363,9 @@ ${BOLD}Targets:${RESET}
 ${BOLD}Options:${RESET}
   ${CLR_SUCCESS}--help, -h${RESET}
       Show this help message.
+
+  ${CLR_SUCCESS}--version, -v${RESET}
+      Show the installed version.
 
   ${CLR_SUCCESS}--no-ignore, -n${RESET}
       ${BOLD}Temporarily${RESET} bypass all ignore rules for this copy only.
@@ -816,6 +811,7 @@ SKIP_CONFIRM=false
 NO_IGNORE=false
 LIST_IGNORES=false
 SHOW_HELP=false
+SHOW_VERSION=false
 PRINT_CONTENT=false
 RESET_CONFIG=false
 NO_TREE=false
@@ -831,6 +827,7 @@ while (( $# )); do
     --reset-config|-r) RESET_CONFIG=true; shift ;;
     --no-tree|-t)   NO_TREE=true;         shift ;;
     --help|-h)      SHOW_HELP=true;       shift ;;
+    --version|-v)   SHOW_VERSION=true;    shift ;;
     --ignore|-i)
       shift
       [[ $# -eq 0 ]] && { printf "%s\n" "${CLR_ERROR}Error: --ignore requires arguments.${RESET}" >&2; exit 1; }
@@ -850,6 +847,7 @@ while (( $# )); do
 done
 
 [[ "$SHOW_HELP" == true ]] && { print_help; exit 0; }
+[[ "$SHOW_VERSION" == true ]] && { echo "catclip $VERSION"; exit 0; }
 
 if [[ "$RESET_CONFIG" == true ]]; then
   echo "${CLR_WARN}This will overwrite ${BOLD}$CONFIG${RESET}${CLR_WARN} with factory defaults.${RESET}" >&2
@@ -1433,6 +1431,36 @@ if [[ "$SKIP_CONFIRM" == false && $est_tokens -gt $TOKEN_WARN_LIMIT ]]; then
   fi
 fi
 
+# 14.5) CLIPBOARD DETECTION (late)
+CLIPBOARD_CMD=""
+USE_CLIPBOARD=true
+if ! CLIPBOARD_CMD="$(detect_clipboard_cmd)"; then
+  if [[ "$PRINT_CONTENT" == true ]]; then
+    USE_CLIPBOARD=false
+    printf "${CLR_WARN}Warning: No clipboard tool found. Printing to stdout only.${RESET}\n" >&2
+  else
+    echo "Error: No clipboard tool found." >&2
+    case "$OS_TYPE" in
+      macos) echo "  Install Xcode command line tools or ensure pbcopy is in PATH." >&2 ;;
+      wsl)   echo "  Ensure clip.exe is available, or install xclip." >&2 ;;
+      linux)
+             # Detect display server to recommend the right tool
+             if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+               echo "  Wayland detected. Install wl-clipboard:" >&2
+               echo "    Ubuntu/Debian: sudo apt install wl-clipboard" >&2
+               echo "    Fedora/RHEL:   sudo dnf install wl-clipboard" >&2
+               echo "    Arch:          sudo pacman -S wl-clipboard" >&2
+             else
+               echo "  X11 detected. Install xclip:" >&2
+               echo "    Ubuntu/Debian: sudo apt install xclip" >&2
+               echo "    Fedora/RHEL:   sudo dnf install xclip" >&2
+               echo "    Arch:          sudo pacman -S xclip" >&2
+             fi ;;
+    esac
+    exit 1
+  fi
+fi
+
 # 15) PHASE 3: EXECUTION
 TMPFILE="$(mktemp)"
 
@@ -1456,28 +1484,30 @@ awk -v warn="$CLR_WARN" -v reset="$RESET" '
 
 # Use eval to handle multi-word clipboard commands (e.g., "xclip -selection clipboard")
 # This is safe because CLIPBOARD_CMD is set internally, not from user input
-if ! eval "$CLIPBOARD_CMD" < "$TMPFILE" 2>/dev/null; then
-  printf "\n${CLR_ERROR}✗ Clipboard copy failed!${RESET}\n" >&2
-  printf "${DIM}The clipboard tool '${CLIPBOARD_CMD%% *}' could not copy the content.${RESET}\n" >&2
-  
-  # Provide platform-specific guidance
-  case "$OS_TYPE" in
-    linux)
-      if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-        printf "${CLR_WARN}You appear to be on Wayland. Install wl-clipboard:${RESET}\n" >&2
-        printf "  sudo apt install wl-clipboard  ${DIM}# Ubuntu/Debian${RESET}\n" >&2
-      else
-        printf "${CLR_WARN}Try installing xclip:${RESET}\n" >&2
-        printf "  sudo apt install xclip  ${DIM}# Ubuntu/Debian${RESET}\n" >&2
-      fi
-      ;;
-  esac
-  
-  printf "\n${DIM}Alternatively, use --print to output to terminal:${RESET}\n" >&2
-  printf "  catclip --print > output.txt\n" >&2
-  exit 1
+if [[ "$USE_CLIPBOARD" == true ]]; then
+  if ! eval "$CLIPBOARD_CMD" < "$TMPFILE" 2>/dev/null; then
+    printf "\n${CLR_ERROR}✗ Clipboard copy failed!${RESET}\n" >&2
+    printf "${DIM}The clipboard tool '${CLIPBOARD_CMD%% *}' could not copy the content.${RESET}\n" >&2
+    
+    # Provide platform-specific guidance
+    case "$OS_TYPE" in
+      linux)
+        if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+          printf "${CLR_WARN}You appear to be on Wayland. Install wl-clipboard:${RESET}\n" >&2
+          printf "  sudo apt install wl-clipboard  ${DIM}# Ubuntu/Debian${RESET}\n" >&2
+        else
+          printf "${CLR_WARN}Try installing xclip:${RESET}\n" >&2
+          printf "  sudo apt install xclip  ${DIM}# Ubuntu/Debian${RESET}\n" >&2
+        fi
+        ;;
+    esac
+    
+    printf "\n${DIM}Alternatively, use --print to output to terminal:${RESET}\n" >&2
+    printf "  catclip --print > output.txt\n" >&2
+    exit 1
+  fi
+  printf "\n${CLR_SUCCESS}✔${RESET} ${BOLD}Copied to clipboard!${RESET}\n" >&2
 fi
-printf "\n${CLR_SUCCESS}✔${RESET} ${BOLD}Copied to clipboard!${RESET}\n" >&2
 
 if [[ "$PRINT_CONTENT" == true ]]; then
   cat "$TMPFILE"

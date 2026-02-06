@@ -36,8 +36,16 @@ All **solved** with `catclip`.
 ---
 
 ## Installation
+
+### Homebrew (Recommended)
 ```bash
-git clone https://github.com/you/catclip.git
+brew tap tigreau/catclip && brew install catclip
+```
+Note: Homebrew installs the CLI only. The example project is available when you clone the repo.
+
+### From Source (Git)
+```bash
+git clone https://github.com/tigreau/catclip.git
 cd catclip && ./install.sh
 ```
 
@@ -46,7 +54,7 @@ cd catclip && ./install.sh
 - Linux: `xclip` or `wl-clipboard`
 - WSL: Built-in ✓
 
-<details><summary>Manual installation</summary>
+<details><summary>Manual install (no script)</summary>
 
 ```bash
 cp catclip /usr/local/bin/
@@ -56,12 +64,15 @@ cp ignore.yaml ~/.config/catclip/ignore.yaml
 </details>
 
 <details><summary>Updating & Uninstalling</summary>
+Use the section that matches how you installed catclip.
 
 ```bash
-# Update
-git pull && ./install.sh
+# Homebrew
+brew upgrade catclip
+brew uninstall catclip
 
-# Uninstall
+# From Source (Git)
+git pull && ./install.sh
 ./uninstall.sh
 ```
 </details>
@@ -69,11 +80,11 @@ git pull && ./install.sh
 ---
 
 ## Try It
-The repository includes a `dummy-react-project` to experiment with:
+The repository includes a `dummy-react-project` to experiment with (clone the repo to access it):
 ```bash
 cd dummy-react-project
-catclip components          # Fuzzy search
-catclip layout/Sidebar.tsx  # Chained path
+catclip components          # Copy directory
+catclip layout/Sidebar.tsx  # Copy file
 ```
 
 ---
@@ -93,7 +104,7 @@ catclip hooks/auth/useLogin.ts
 catclip src/components/ui/Button.tsx
 
 # Multiple targets at once:
-catclip README.md src docs/
+catclip README.md src docs
 ```
 
 <details>
@@ -129,7 +140,7 @@ ignore_files:
 Quick config:
 `catclip --ignore +'*.log' -'old.tmp' d+build d-src`
 
-*Adds `*.log` and `build/`, removes `old.tmp` and `src/` from **ignore list**
+Adds `*.log` and `build/`, removes `old.tmp` and `src/` from **ignore list**
 
 Tip: Use `--ignore` with targets to apply changes for this run only:
 `catclip src --ignore +'main.tsx'`
