@@ -5,15 +5,30 @@ One command to copy your entire codebase to clipboard for AI assistants.
 catclip src  # That's it.
 ```
 
-**Why?** Born from the frustration of `echo "$(cat *)" | pbcopy` and wanting 
-recursive directory copying without manual filtering.
+**Why?** Born from the frustration of:
+
+🫩 manual copy‑pasting across folders  
+😵‍💫 one‑off commands that aren’t recursive  
+😫 commands too long or fiddly to repeat consistently  
+🫣 accidentally including binaries or huge artifacts  
+😱 paths breaking on spaces or weird characters  
+🫥 missing hidden files or sibling folders
+
+...
+
+*You name it.*
+
+All **solved** with `catclip`.
 
 ---
 
 ## Features
 
 - 🔍 Fuzzy search - `catclip components` finds any nested directory
-- 🔗 Chained paths - `catclip auth/components/Login.tsx` more specific in case there are multiple directories with the same name
+- 🔗 Chained paths - `catclip shared/components` more specific in case there are multiple `components` directories
+- 🧠 Fast exact paths - `catclip src/components/ui/Button.tsx` is perfect with tab-tab completion
+- 🧩 Multiple targets - `catclip README.md src docs` in one run
+- 🧾 File headers in output - each file is prefixed with `# File: path/to/file`
 - 🛡️ Secret protection - Blocks `.env`, keys, credentials
 - 🌳 Visual preview - Tree view before copying
 - 🙈 Git-aware - Respects `.gitignore`
@@ -54,11 +69,11 @@ git pull && ./install.sh
 ---
 
 ## Try It
-The repository includes an `example-react` project to experiment with:
+The repository includes a `dummy-react-project` to experiment with:
 ```bash
-cd example-react
-catclip components       # Fuzzy search
-catclip hooks/useAuth.ts # Chained path
+cd dummy-react-project
+catclip components          # Fuzzy search
+catclip layout/Sidebar.tsx  # Chained path
 ```
 
 ---
@@ -72,21 +87,27 @@ catclip src
 catclip components              # Finds any 'components' dir
 
 # Specific file via chained path:
-catclip auth/components/Login.tsx
+catclip hooks/auth/useLogin.ts
+
+# Exact file path (tab-tab from repo root):
+catclip src/components/ui/Button.tsx
+
+# Multiple targets at once:
+catclip README.md src docs/
 ```
 
 <details>
 <summary><b>More Examples</b></summary>
 
 ```bash
-# Copy multiple targets:
-catclip README.md src config/
-
 # Override filters:
 catclip --no-ignore dist
 
 # Copy & Print to stdout:
 catclip --print src
+
+# Temporary ignore file (this run only):
+catclip src/features/auth --ignore +'LoginForm.tsx'
 ```
 
 </details>
@@ -108,7 +129,10 @@ ignore_files:
 Quick config:
 `catclip --ignore +'*.log' -'old.tmp' d+build d-src`
 
-*Adds `*.log` and `build/`, removes `old.tmp` and `src/` from ignore list*
+*Adds `*.log` and `build/`, removes `old.tmp` and `src/` from **ignore list**
+
+Tip: Use `--ignore` with targets to apply changes for this run only:
+`catclip src --ignore +'main.tsx'`
 
 ---
 
@@ -116,11 +140,14 @@ Quick config:
 
 | Flag | Description |
 |------|-------------|
-| `-h` | Show help |
-| `-y` | Skip confirmation |
-| `--no-ignore` | Include ignored files |
-| `--list-ignores` | Show ignore rules |
-| `--ignore <ops>` | Modify ignore list |
+| `-h`, `--help` | Show help |
+| `-y`, `--yes` | Skip confirmation |
+| `-n`, `--no-ignore` | Include ignored files |
+| `-p`, `--print` | Print to terminal in addition to clipboard |
+| `-l`, `--list-ignores` | Show ignore rules |
+| `-t`, `--no-tree` | Skip tree rendering |
+| `-r`, `--reset-config` | Restore default ignore config |
+| `-i`, `--ignore <ops>` | Modify ignore list |
 
 Full docs: `catclip --help`
 
