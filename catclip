@@ -134,6 +134,32 @@ CLR_TREE=$'\033[90m'
 CLR_PROMPT=$'\033[36m'
 CLR_GIT=$'\033[35m'
 
+# Prompt for y/n with a default without failing in non-interactive contexts.
+# Sets PROMPT_RESPONSE to "y" or "n" (lowercase).
+prompt_yn() {
+  local prompt="$1"
+  local default="$2" # "y" or "n"
+  PROMPT_RESPONSE="$default"
+
+  # Preferred: if stdout or stderr is a TTY, prompt there.
+  if [[ -t 1 || -t 2 ]]; then
+    printf "%s" "$prompt" >&2
+    read -r -n 1 PROMPT_RESPONSE 2>/dev/null || PROMPT_RESPONSE="$default"
+    echo >&2
+  # Fallback: /dev/tty (may not exist in some contexts)
+  elif [[ -r /dev/tty ]]; then
+    if printf "%s" "$prompt" > /dev/tty 2>/dev/null; then
+      read -r -n 1 PROMPT_RESPONSE < /dev/tty 2>/dev/null || PROMPT_RESPONSE="$default"
+      printf "\n" >&2
+    fi
+  fi
+
+  if [[ -z "$PROMPT_RESPONSE" ]]; then
+    PROMPT_RESPONSE="$default"
+  fi
+  PROMPT_RESPONSE=$(printf "%s" "$PROMPT_RESPONSE" | tr 'A-Z' 'a-z')
+}
+
 # 3) CONFIGURATION MANAGEMENT
 # XDG Base Directory spec: ~/.config/catclip/ignore.yaml
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/catclip"
@@ -535,27 +561,6 @@ vim|dart|vue|svelte|astro|tex|j2|ejs|hbs|mustache|liquid|pug|jade)
 
 # Prompt for y/n with a default without failing in non-interactive contexts.
 # Sets PROMPT_RESPONSE to "y" or "n" (lowercase).
-prompt_yn() {
-  local prompt="$1"
-  local default="$2" # "y" or "n"
-  PROMPT_RESPONSE=""
-
-  if [[ -r /dev/tty ]]; then
-    printf "%s" "$prompt" >&2
-    read -r -n 1 PROMPT_RESPONSE < /dev/tty || PROMPT_RESPONSE=""
-    echo >&2
-  elif [[ -t 0 ]]; then
-    printf "%s" "$prompt" >&2
-    read -r -n 1 PROMPT_RESPONSE || PROMPT_RESPONSE=""
-    echo >&2
-  fi
-
-  if [[ -z "$PROMPT_RESPONSE" ]]; then
-    PROMPT_RESPONSE="$default"
-  fi
-  PROMPT_RESPONSE=$(printf "%s" "$PROMPT_RESPONSE" | tr 'A-Z' 'a-z')
-}
-
 # ------------------------------------------------------------------------------
 # PATH RESOLUTION HELPERS
 # ------------------------------------------------------------------------------
