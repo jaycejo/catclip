@@ -166,9 +166,12 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/catclip"
 CONFIG="$CONFIG_DIR/ignore.yaml"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SHARE_TEMPLATE="$PREFIX_DIR/share/catclip/ignore.yaml"
+SHARE_DIR="$PREFIX_DIR/share/catclip"
+SHARE_TEMPLATE="$SHARE_DIR/ignore.yaml"
 VERSION="dev"
-if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
+if [[ -f "$SHARE_DIR/VERSION" ]]; then
+  VERSION="$(tr -d ' \t\r\n' < "$SHARE_DIR/VERSION")"
+elif [[ -f "$SCRIPT_DIR/VERSION" ]]; then
   VERSION="$(tr -d ' \t\r\n' < "$SCRIPT_DIR/VERSION")"
 fi
 if [[ -n "${CATCLIP_VERSION:-}" ]]; then
