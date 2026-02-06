@@ -57,8 +57,22 @@ cd catclip && ./install.sh
 <details><summary>Manual install (no script)</summary>
 
 ```bash
-cp catclip /usr/local/bin/
-mkdir -p ~/.config/catclip
+PREFIX="${PREFIX:-/usr/local}"
+BIN_DIR="$PREFIX/bin"
+SHARE_DIR="$PREFIX/share/catclip"
+
+mkdir -p "$BIN_DIR" "$SHARE_DIR" ~/.config/catclip
+cp catclip "$BIN_DIR/"
+cp VERSION "$SHARE_DIR/VERSION"
+cp ignore.yaml ~/.config/catclip/ignore.yaml
+```
+
+If you prefer a user-local install (no sudo):
+```bash
+PREFIX="$HOME/.local"
+mkdir -p "$PREFIX/bin" "$PREFIX/share/catclip" ~/.config/catclip
+cp catclip "$PREFIX/bin/"
+cp VERSION "$PREFIX/share/catclip/VERSION"
 cp ignore.yaml ~/.config/catclip/ignore.yaml
 ```
 </details>

@@ -26,6 +26,7 @@ DEST_CONFIG="$CONFIG_DIR/ignore.yaml"
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC_SCRIPT="$SRC_DIR/catclip"
 SRC_CONFIG="$SRC_DIR/ignore.yaml"
+SRC_VERSION="$SRC_DIR/VERSION"
 
 # ------------------------------------------------------------------------------
 # 2) Helper: Validation Function
@@ -56,6 +57,11 @@ fi
 
 if [[ ! -f "$SRC_CONFIG" ]]; then
   echo "${RED}Error: 'ignore.yaml' missing in $SRC_DIR${RESET}"
+  exit 1
+fi
+
+if [[ ! -f "$SRC_VERSION" ]]; then
+  echo "${RED}Error: 'VERSION' missing in $SRC_DIR${RESET}"
   exit 1
 fi
 
@@ -232,6 +238,18 @@ if [[ ! -w "$BIN_DIR" ]] && [[ "$PREFIX" == "/usr/local" ]]; then
 else
     mkdir -p "$BIN_DIR"
     install -m 755 "$SRC_SCRIPT" "$BIN_DIR/catclip"
+fi
+
+# ------------------------------------------------------------------------------
+# 7.5) Install Version File (share/catclip)
+# ------------------------------------------------------------------------------
+SHARE_DIR="$PREFIX/share/catclip"
+if [[ ! -w "$BIN_DIR" ]] && [[ "$PREFIX" == "/usr/local" ]]; then
+    sudo mkdir -p "$SHARE_DIR"
+    sudo install -m 644 "$SRC_VERSION" "$SHARE_DIR/VERSION"
+else
+    mkdir -p "$SHARE_DIR"
+    install -m 644 "$SRC_VERSION" "$SHARE_DIR/VERSION"
 fi
 
 # ------------------------------------------------------------------------------
