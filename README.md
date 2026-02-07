@@ -112,7 +112,7 @@ catclip src
 catclip components              # Finds any 'components' dir
 
 # Specific file via chained path:
-catclip hooks/auth/useLogin.ts
+catclip auth/hooks/useLogin.ts
 
 # Exact file path (tab-tab from repo root):
 catclip src/components/ui/Button.tsx
@@ -131,8 +131,8 @@ catclip --no-ignore dist
 # Copy & Print to stdout:
 catclip --print src
 
-# Temporary ignore file (this run only):
-catclip src/features/auth --ignore +'LoginForm.tsx'
+# Temporary ignore (this run only):
+catclip src/features/authentication --ignore +'LoginForm.tsx'
 ```
 
 </details>
@@ -152,7 +152,7 @@ ignore_files:
 ```
 
 Quick config:
-`catclip --ignore +'*.log' -'old.tmp' d+build d-src`
+`catclip --ignore-always +'*.log' -'old.tmp' d+build d-src`
 
 Adds `*.log` and `build/`, removes `old.tmp` and `src/` from **ignore list**
 
@@ -172,7 +172,8 @@ Tip: Use `--ignore` with targets to apply changes for this run only:
 | `-l`, `--list-ignores` | Show ignore rules |
 | `-t`, `--no-tree` | Skip tree rendering |
 | `-r`, `--reset-config` | Restore default ignore config |
-| `-i`, `--ignore <ops>` | Modify ignore list |
+| `-i`, `--ignore <ops>` | Temporary ignores for this run only |
+| `--ignore-always <ops>` | Modify ignore list |
 
 Full docs: `catclip --help`
 
@@ -204,7 +205,7 @@ Or fallback to stdout: `catclip --print src > code.txt`
 Check: `catclip --list-ignores`
 Bypass once: `catclip --no-ignore name`
 or
-Permanently un-ignore: `catclip --ignore d-name`
+Permanently un-ignore: `catclip --ignore-always d-name`
 
 </details>
 

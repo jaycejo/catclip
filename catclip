@@ -280,7 +280,7 @@ EOF
 if [[ ! -f "$CONFIG" ]]; then
   printf "\n%s\n" "${CLR_WARN}Config Not Found: ${BOLD}$CONFIG${RESET}" >&2
   printf "%s\n" "${DIM}No ignore configuration exists.${RESET}" >&2
-  prompt_yn "\n${CLR_WARN}Would you like to create default configuration? [Y/n]${RESET} " "y"
+  prompt_yn $'\n'"${CLR_WARN}Would you like to create default configuration? [Y/n]${RESET} " "y"
   if [[ "$PROMPT_RESPONSE" == "n" ]]; then
     echo "${CLR_WARN}Continuing without ignore rules (all text files will be included)...${RESET}" >&2
   else
@@ -367,12 +367,12 @@ ${BOLD}Usage:${RESET}
 
 ${BOLD}Targets:${RESET}
   ${BOLD}Fuzzy Directory Search:${RESET}
-    ${CLR_SUCCESS}catclip authentication${RESET}          # Finds src/features/authentication (finds any directory matching 'authentication')
+    ${CLR_SUCCESS}catclip auth${RESET}                   # Finds pages/auth and features/authentication (any directory matching 'auth')
     ${CLR_SUCCESS}catclip components${RESET}              # Finds src/components, authentication/components, etc. (prompts if multiple)
   
   ${BOLD}Chained Path Resolution:${RESET}
-    ${CLR_SUCCESS}catclip authentication/components/LoginForm.tsx${RESET}  # Resolves 'authentication' → 'components' → copies 'LoginForm.tsx'
-    ${CLR_SUCCESS}catclip authentication/api${RESET}                       # Resolves 'authentication' → 'api' → copies directory contents
+    ${CLR_SUCCESS}catclip shared/components/Badge.tsx${RESET}  # Resolves 'shared' → 'components' → copies 'Badge.tsx'
+    ${CLR_SUCCESS}catclip auth/api${RESET}                      # Resolves 'auth' → 'api' → copies directory contents
 
   ${BOLD}Full Relative Paths:${RESET}
     ${CLR_SUCCESS}catclip src/components/ui/Button.tsx${RESET}    # Fast. Use Tab completion from root (src/[TAB]/[TAB]...)
@@ -393,41 +393,42 @@ ${BOLD}Options:${RESET}
   ${CLR_SUCCESS}--help, -h${RESET}
       Show this help message.
 
-  ${CLR_SUCCESS}--version, -v${RESET}
-      Show the installed version.
+  ${CLR_SUCCESS}--ignore, -i [OPERATIONS]${RESET}
+      Temporary ignores for this run only (does not modify your config).
+      ${CYAN}Legend:${RESET} + = adds to ignore, - = removes from ignore, d = directory.
+      ${CYAN}Quote globs/spaces:${RESET} +'*.css' d+'my dir'
+      
+      ${CLR_SUCCESS}catclip src --ignore +'*.css' d-tests -'*.log'${RESET}
+      ${DIM}# → Ignore CSS, include tests dir, include logs (just this run)${RESET}
+
+  ${CLR_SUCCESS}--ignore-always [OPERATIONS]${RESET}
+      Persistently modify your ignore list (saves to ~/.config/catclip/ignore.yaml).
+      Same syntax as --ignore.
+      
+      ${CLR_SUCCESS}catclip --ignore-always d+node_modules +'*.map' -package-lock.json${RESET}
+      ${DIM}# → Add node_modules/ and *.map to ignore list, remove lockfile from ignore list${RESET}
 
   ${CLR_SUCCESS}--no-ignore, -n${RESET}
-      ${BOLD}Temporarily${RESET} bypass all ignore rules for this copy only.
+      Temporarily bypass all ignore rules for this copy only.
       
-      ${DIM}catclip --no-ignore dist${RESET}
-      ${DIM}catclip --no-ignore .env.local${RESET}
-
-  ${CLR_SUCCESS}--yes, -y${RESET}
-      Skip confirmation prompt (useful for large copies or scripts).
-
-  ${CLR_SUCCESS}--print, -p${RESET}
-      Print to terminal in addition to copying to clipboard.
+      ${CLR_SUCCESS}catclip --no-ignore dist${RESET}
+      ${CLR_SUCCESS}catclip --no-ignore .env.local${RESET}
 
   ${CLR_SUCCESS}--list-ignores, -l${RESET}
       Show what files and directories are currently being ignored.
 
+  ${CLR_SUCCESS}--print, -p${RESET}
+      Print to terminal in addition to copying to clipboard.
+
   ${CLR_SUCCESS}--no-tree, -t${RESET}
       Skip tree rendering for faster output on large file sets.
 
-  ${CLR_SUCCESS}--ignore, -i [OPERATIONS]${RESET}
-      Permanently modify your ignore list.
-      
-      ${BOLD}Add/remove files:${RESET}  +'pattern'  -'pattern'
-      ${BOLD}Add/remove dirs:${RESET}   d+dirname  d-dirname
-      ${DIM}Quote after +/- if it has spaces or globs:${RESET}
-      ${DIM}  +'<pattern>'  -'*.ts'  d+'my dir'${RESET}
-      
-      ${DIM}catclip --ignore +'*.log' -'secret.json' d+build d-src${RESET}
-      # → Ignores .log files, un-ignores secret.json
-      # → Ignores 'build' directory, un-ignores 'src' directory
-      ${DIM}catclip src --ignore +'main.tsx'${RESET}
-      # → Temporarily ignores main.tsx for this run only
-  
+  ${CLR_SUCCESS}--yes, -y${RESET}
+      Skip confirmation prompt (useful for large copies or scripts).
+
+  ${CLR_SUCCESS}--version, -v${RESET}
+      Show the installed version.
+
   ${CLR_SUCCESS}--reset-config, -r${RESET}
       Restore the configuration file to factory defaults.
 
@@ -823,7 +824,9 @@ SHOW_VERSION=false
 PRINT_CONTENT=false
 RESET_CONFIG=false
 NO_TREE=false
-IGNORE_OPS=()
+IGNORE_OPS=()       # shared scratch for apply_ignore_ops
+TMP_IGNORE_OPS=()   # temporary ignores (this run only)
+PERM_IGNORE_OPS=()  # persistent ignores (writes config)
 raw_inputs=()
 
 while (( $# )); do
@@ -840,7 +843,15 @@ while (( $# )); do
       shift
       [[ $# -eq 0 ]] && { printf "%s\n" "${CLR_ERROR}Error: --ignore requires arguments.${RESET}" >&2; exit 1; }
       while (( $# )) && [[ $1 =~ ^(d?[+-]) ]]; do
-        IGNORE_OPS+=( "$1" )
+        TMP_IGNORE_OPS+=( "$1" )
+        shift
+      done
+      ;;
+    --ignore-always)
+      shift
+      [[ $# -eq 0 ]] && { printf "%s\n" "${CLR_ERROR}Error: --ignore-always requires arguments.${RESET}" >&2; exit 1; }
+      while (( $# )) && [[ $1 =~ ^(d?[+-]) ]]; do
+        PERM_IGNORE_OPS+=( "$1" )
         shift
       done
       ;;
@@ -905,7 +916,7 @@ fi
 if [[ "$parse_error" == true ]]; then
   printf "\n%s\n" "${CLR_ERROR}Config Corrupted in ${BOLD}$CONFIG${RESET}" >&2
   printf "%s\n" "${CLR_ERROR}➤ $error_msg${RESET}" >&2
-  prompt_yn "\n${CLR_WARN}Would you like to reset to factory defaults? [y/N]${RESET} " "n"
+  prompt_yn $'\n'"${CLR_WARN}Would you like to reset to factory defaults? [y/N]${RESET} " "n"
   if [[ "$PROMPT_RESPONSE" == "y" ]]; then
     get_default_config > "$CONFIG"
     echo "${CLR_SUCCESS}Configuration reset. Retrying...${RESET}" >&2
@@ -919,14 +930,25 @@ fi
 # Check for empty config (both arrays empty = likely broken/cleared config)
 if (( ${#ignore_dirs[@]} == 0 && ${#ignore_files[@]} == 0 )); then
   printf "\n%s\n" "${CLR_WARN}Config Empty in ${BOLD}$CONFIG${RESET}" >&2
-  printf "%s\n" "${DIM}No ignore rules defined. This may cause unexpected behavior.${RESET}" >&2
-  prompt_yn "\n${CLR_WARN}Would you like to reset to factory defaults? [y/N]${RESET} " "n"
+  printf "%s\n" "${DIM}No ignore rules defined. Press y to restore defaults, or continue using .gitignore only.${RESET}" >&2
+  prompt_yn $'\n'"${CLR_WARN}Would you like to reset to factory defaults? [y/N]${RESET} " "n"
   if [[ "$PROMPT_RESPONSE" == "y" ]]; then
     get_default_config > "$CONFIG"
     echo "${CLR_SUCCESS}Configuration reset. Retrying...${RESET}" >&2
     exec "$0" "$@"
   else
     echo "${CLR_WARN}Continuing with empty config...${RESET}" >&2
+  fi
+fi
+
+# 7.5) GIT CONTEXT DETECTION (shared for list-ignores and banner)
+IS_GIT=false
+HAS_GITIGNORE=false
+GIT_ROOT=""
+if [[ "$HAS_GIT" == true ]]; then
+  if GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
+    IS_GIT=true
+    [[ -f "$GIT_ROOT/.gitignore" ]] && HAS_GITIGNORE=true
   fi
 fi
 
@@ -971,52 +993,58 @@ apply_ignore_ops() {
   done
 }
 
-if (( ${#IGNORE_OPS[@]} > 0 )); then
-  if (( ${#raw_inputs[@]} > 0 )); then
-    printf "%s\n" "${BOLD}${CLR_WARN}Temporary ignore (this run):${RESET}" >&2
-    apply_ignore_ops
-    if (( ${#added_files[@]} > 0 )); then
-      printf "${BOLD}Ignored files:${RESET}\n" >&2
-      for f in "${added_files[@]}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f" >&2; done
-    fi
-    if (( ${#added_dirs[@]} > 0 )); then
-      printf "${BOLD}Ignored directories:${RESET}\n" >&2
-      for d in "${added_dirs[@]}"; do printf "  ${CLR_ERROR}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d" >&2; done
-    fi
-    if (( ${#removed_files[@]} > 0 )); then
-      printf "${BOLD}Unignored files:${RESET}\n" >&2
-      for f in "${removed_files[@]}"; do printf "  ${CLR_SUCCESS}•${RESET} %s\n" "$f" >&2; done
-    fi
-    if (( ${#removed_dirs[@]} > 0 )); then
-      printf "${BOLD}Unignored directories:${RESET}\n" >&2
-      for d in "${removed_dirs[@]}"; do printf "  ${CLR_SUCCESS}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d" >&2; done
-    fi
+if (( ${#PERM_IGNORE_OPS[@]} > 0 )); then
+  IGNORE_OPS=( "${PERM_IGNORE_OPS[@]}" )
+  printf "%s\n" "${BOLD}Updating ignore list in ${DIM}$CONFIG${RESET}" >&2
+  apply_ignore_ops
+
+  {
+    echo "ignore_dirs:"
+    for d in "${ignore_dirs[@]}"; do echo "  - $d"; done
+    echo "ignore_files:"
+    for f in "${ignore_files[@]}"; do echo "  - \"$f\""; done
+  } >"$CONFIG"
+
+  printf "\n${BOLD}New Configuration:${RESET}\n" >&2
+  printf "\n${BOLD}Ignored Directories (YAML):${RESET}\n" >&2
+  for d in "${ignore_dirs[@]}"; do printf "  ${CLR_ERROR}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d" >&2; done
+  printf "\n${BOLD}Ignored Files (YAML):${RESET}\n" >&2
+  for f in "${ignore_files[@]}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f" >&2; done
+
+  printf "\n${BOLD}Changes applied:${RESET}\n" >&2
+  for change in "${changes_log[@]}"; do printf "  %s\n" "$change" >&2; done
+
+  if [[ "$HAS_GIT" == true ]] && git rev-parse --show-toplevel &>/dev/null; then
+    printf "\n${CLR_GIT}Note: Files listed in .gitignore remain excluded automatically.${RESET}\n" >&2
   else
-    printf "%s\n" "${BOLD}Updating ignore list in ${DIM}$CONFIG${RESET}" >&2
-    apply_ignore_ops
+    printf "\n${DIM}Note: If used inside a Git project, .gitignore rules will also apply.${RESET}\n" >&2
+  fi
+  exit 0
+fi
 
-    {
-      echo "ignore_dirs:"
-      for d in "${ignore_dirs[@]}"; do echo "  - $d"; done
-      echo "ignore_files:"
-      for f in "${ignore_files[@]}"; do echo "  - \"$f\""; done
-    } >"$CONFIG"
-
-    printf "\n${BOLD}New Configuration:${RESET}\n" >&2
-    printf "\n${BOLD}Ignored Directories (YAML):${RESET}\n" >&2
-    for d in "${ignore_dirs[@]}"; do printf "  ${CLR_ERROR}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d" >&2; done
-    printf "\n${BOLD}Ignored Files (YAML):${RESET}\n" >&2
-    for f in "${ignore_files[@]}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f" >&2; done
-
-    printf "\n${BOLD}Changes applied:${RESET}\n" >&2
-    for change in "${changes_log[@]}"; do printf "  %s\n" "$change" >&2; done
-
-    if [[ "$HAS_GIT" == true ]] && git rev-parse --show-toplevel &>/dev/null; then
-      printf "\n${CLR_GIT}Note: Files listed in .gitignore remain excluded automatically.${RESET}\n" >&2
-    else
-      printf "\n${DIM}Note: If used inside a Git project, .gitignore rules will also apply.${RESET}\n" >&2
-    fi
-    exit 0
+if (( ${#TMP_IGNORE_OPS[@]} > 0 )); then
+  if (( ${#raw_inputs[@]} == 0 )); then
+    printf "%s\n" "${CLR_ERROR}Error: --ignore is temporary; provide targets or use --ignore-always to persist.${RESET}" >&2
+    exit 1
+  fi
+  IGNORE_OPS=( "${TMP_IGNORE_OPS[@]}" )
+  printf "%s\n" "${BOLD}${CLR_WARN}Temporary ignore (this run):${RESET}" >&2
+  apply_ignore_ops
+  if (( ${#added_files[@]} > 0 )); then
+    printf "${BOLD}Ignored files:${RESET}\n" >&2
+    for f in "${added_files[@]}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f" >&2; done
+  fi
+  if (( ${#added_dirs[@]} > 0 )); then
+    printf "${BOLD}Ignored directories:${RESET}\n" >&2
+    for d in "${added_dirs[@]}"; do printf "  ${CLR_ERROR}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d" >&2; done
+  fi
+  if (( ${#removed_files[@]} > 0 )); then
+    printf "${BOLD}Unignored files:${RESET}\n" >&2
+    for f in "${removed_files[@]}"; do printf "  ${CLR_SUCCESS}•${RESET} %s\n" "$f" >&2; done
+  fi
+  if (( ${#removed_dirs[@]} > 0 )); then
+    printf "${BOLD}Unignored directories:${RESET}\n" >&2
+    for d in "${removed_dirs[@]}"; do printf "  ${CLR_SUCCESS}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d" >&2; done
   fi
 fi
 
@@ -1031,9 +1059,8 @@ if [[ "$LIST_IGNORES" == true ]]; then
   printf "\n${BOLD}Ignored Files (YAML):${RESET}\n" >&2
   for f in "${ignore_files[@]:-}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f" >&2; done
 
-  if [[ "$HAS_GIT" == true ]] && git rev-parse --show-toplevel &>/dev/null; then
-    git_root=$(git rev-parse --show-toplevel)
-    git_ignore_file="$git_root/.gitignore"
+  if [[ "$IS_GIT" == true ]]; then
+    git_ignore_file="$GIT_ROOT/.gitignore"
     if [[ -f "$git_ignore_file" ]]; then
       printf "\n${BOLD}Ignored Files (Project .gitignore):${RESET}\n" >&2
       printf "${DIM}%s${RESET}\n" "$git_ignore_file" >&2
@@ -1041,7 +1068,7 @@ if [[ "$LIST_IGNORES" == true ]]; then
         printf "  ${CLR_GIT}•${RESET} %s\n" "$line" >&2
       done
     else
-      printf "\n${DIM}(No .gitignore found in project root)${RESET}\n" >&2  
+      printf "\n${DIM}(No .gitignore found at %s)${RESET}\n" "$GIT_ROOT" >&2  
     fi
   fi
   exit 0
@@ -1051,7 +1078,14 @@ fi
 (( ${#raw_inputs[@]} == 0 )) && raw_inputs=( "." )
 
 IS_GIT=false
-if [[ "$HAS_GIT" == true ]] && git rev-parse --show-toplevel &>/dev/null 2>&1; then IS_GIT=true; fi
+HAS_GITIGNORE=false
+GIT_ROOT=""
+if [[ "$HAS_GIT" == true ]]; then
+  if GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
+    IS_GIT=true
+    [[ -f "$GIT_ROOT/.gitignore" ]] && HAS_GITIGNORE=true
+  fi
+fi
 
 file_targets=()
 dir_targets=()
@@ -1409,12 +1443,14 @@ printf "\n${BOLD}Files to Copy:${RESET}\n" >&2
 
 if [[ "$NO_IGNORE" == true ]]; then
   printf "  ${CLR_WARN}⚠️  Filters DISABLED (--no-ignore)${RESET}\n" >&2
-elif [[ "$IS_GIT" == true ]]; then
-  printf "  ${CLR_GIT}Excluding files in both .gitignore and %s${RESET}\n" "$CONFIG" >&2
+elif [[ "$IS_GIT" == true && "$HAS_GITIGNORE" == true ]]; then
+  printf "  ${CLR_GIT}Excluding files matched by .gitignore (git repo) and %s${RESET}\n" "$CONFIG" >&2
+elif [[ "$IS_GIT" == true && "$HAS_GITIGNORE" == false ]]; then
+  printf "  ${CLR_WARN}Git repo detected but no .gitignore found; only %s applies.${RESET}\n" "$CONFIG" >&2
 elif [[ "$HAS_GIT" == false ]]; then
-  printf "  ${CLR_WARN}git not installed, only excluding files in %s${RESET}\n" "$CONFIG" >&2
+  printf "  ${CLR_WARN}git not installed; only %s applies (no .gitignore support).${RESET}\n" "$CONFIG" >&2
 else
-  printf "  ${CLR_WARN}Not a git repo, only excluding files in %s${RESET}\n" "$CONFIG" >&2
+  printf "  ${CLR_WARN}Not a git repo; only %s applies (standalone .gitignore files are ignored).${RESET}\n" "$CONFIG" >&2
 fi
 
 if [[ "$NO_TREE" == false ]]; then
