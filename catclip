@@ -395,6 +395,7 @@ ${BOLD}Options:${RESET}
 
   ${CLR_SUCCESS}--ignore, -i [OPERATIONS]${RESET}
       Temporary ignores for this run only (does not modify your config).
+      If no targets are provided, defaults to current directory (.).
       ${CYAN}Legend:${RESET} + = adds to ignore, - = removes from ignore, d = directory.
       ${CYAN}Quote globs/spaces:${RESET} +'*.css' d+'my dir'
       
@@ -419,6 +420,10 @@ ${BOLD}Options:${RESET}
 
   ${CLR_SUCCESS}--print, -p${RESET}
       Print to terminal in addition to copying to clipboard.
+
+  ${CLR_SUCCESS}--changed${RESET}
+      Copy only files changed since the last commit (git repo required).
+      Optional targets limit the scope (example: catclip src --changed).
 
   ${CLR_SUCCESS}--no-tree, -t${RESET}
       Skip tree rendering for faster output on large file sets.
@@ -824,6 +829,7 @@ SHOW_VERSION=false
 PRINT_CONTENT=false
 RESET_CONFIG=false
 NO_TREE=false
+CHANGED_ONLY=false
 IGNORE_OPS=()       # shared scratch for apply_ignore_ops
 TMP_IGNORE_OPS=()   # temporary ignores (this run only)
 PERM_IGNORE_OPS=()  # persistent ignores (writes config)
@@ -839,21 +845,50 @@ while (( $# )); do
     --no-tree|-t)   NO_TREE=true;         shift ;;
     --help|-h)      SHOW_HELP=true;       shift ;;
     --version|-v)   SHOW_VERSION=true;    shift ;;
+    --changed)     CHANGED_ONLY=true;     shift ;;
     --ignore|-i)
       shift
       [[ $# -eq 0 ]] && { printf "%s\n" "${CLR_ERROR}Error: --ignore requires arguments.${RESET}" >&2; exit 1; }
-      while (( $# )) && [[ $1 =~ ^(d?[+-]) ]]; do
-        TMP_IGNORE_OPS+=( "$1" )
-        shift
+      ops_count=0
+      while (( $# )); do
+        [[ "$1" == --* ]] && break
+        case "$1" in
+          -y|-n|-l|-p|-r|-t|-h|-v|-i) break ;;
+        esac
+        if [[ "$1" =~ ^(d[+-].+|[+-].+)$ ]]; then
+          TMP_IGNORE_OPS+=( "$1" )
+          ((ops_count++))
+          shift
+        else
+          break
+        fi
       done
+      if (( ops_count == 0 )); then
+        printf "%s\n" "${CLR_ERROR}Error: --ignore requires at least one operation (e.g. +'.log' d-build).${RESET}" >&2
+        exit 1
+      fi
       ;;
     --ignore-always)
       shift
       [[ $# -eq 0 ]] && { printf "%s\n" "${CLR_ERROR}Error: --ignore-always requires arguments.${RESET}" >&2; exit 1; }
-      while (( $# )) && [[ $1 =~ ^(d?[+-]) ]]; do
-        PERM_IGNORE_OPS+=( "$1" )
-        shift
+      ops_count=0
+      while (( $# )); do
+        [[ "$1" == --* ]] && break
+        case "$1" in
+          -y|-n|-l|-p|-r|-t|-h|-v|-i) break ;;
+        esac
+        if [[ "$1" =~ ^(d[+-].+|[+-].+)$ ]]; then
+          PERM_IGNORE_OPS+=( "$1" )
+          ((ops_count++))
+          shift
+        else
+          break
+        fi
       done
+      if (( ops_count == 0 )); then
+        printf "%s\n" "${CLR_ERROR}Error: --ignore-always requires at least one operation (e.g. +'.log' d+build).${RESET}" >&2
+        exit 1
+      fi
       ;;
     --) shift; raw_inputs+=( "$@" ); break ;;
     --*) 
@@ -1023,10 +1058,6 @@ if (( ${#PERM_IGNORE_OPS[@]} > 0 )); then
 fi
 
 if (( ${#TMP_IGNORE_OPS[@]} > 0 )); then
-  if (( ${#raw_inputs[@]} == 0 )); then
-    printf "%s\n" "${CLR_ERROR}Error: --ignore is temporary; provide targets or use --ignore-always to persist.${RESET}" >&2
-    exit 1
-  fi
   IGNORE_OPS=( "${TMP_IGNORE_OPS[@]}" )
   printf "%s\n" "${BOLD}${CLR_WARN}Temporary ignore (this run):${RESET}" >&2
   apply_ignore_ops
@@ -1075,8 +1106,6 @@ if [[ "$LIST_IGNORES" == true ]]; then
 fi
 
 # 10) TARGET RESOLUTION (NEW SMART PATH RESOLUTION)
-(( ${#raw_inputs[@]} == 0 )) && raw_inputs=( "." )
-
 IS_GIT=false
 HAS_GITIGNORE=false
 GIT_ROOT=""
@@ -1086,6 +1115,103 @@ if [[ "$HAS_GIT" == true ]]; then
     [[ -f "$GIT_ROOT/.gitignore" ]] && HAS_GITIGNORE=true
   fi
 fi
+
+if [[ "$CHANGED_ONLY" == true ]]; then
+  if [[ "$IS_GIT" != true ]]; then
+    printf "%s\n" "${CLR_ERROR}Error: --changed requires a git repository.${RESET}" >&2
+    exit 1
+  fi
+
+  if (( ${#raw_inputs[@]} > 0 )); then
+    for scope in "${raw_inputs[@]}"; do
+      if contains_parent_traversal "$scope"; then
+        printf "%s\n" "${CLR_ERROR}Error: Cannot traverse above working directory: '$scope'${RESET}" >&2
+        exit 1
+      fi
+      if is_absolute_path "$scope"; then
+        printf "%s\n" "${CLR_ERROR}Error: Absolute paths are not allowed: '$scope'${RESET}" >&2
+        exit 1
+      fi
+      if [[ ! -e "$scope" ]]; then
+        printf "%s\n" "${CLR_ERROR}Error: Target '$scope' does not exist.${RESET}" >&2
+        exit 1
+      fi
+    done
+  fi
+
+  has_head=false
+  if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    has_head=true
+  fi
+
+  changed_files=()
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    [[ ! -e "$GIT_ROOT/$path" ]] && continue
+    if ! is_text_file "$GIT_ROOT/$path"; then
+      continue
+    fi
+
+    if [[ "$NO_IGNORE" != true ]]; then
+      if check_file_ignore "$(basename "$path")"; then
+        continue
+      fi
+
+      if [[ "$IS_GIT" == true ]] && git check-ignore -q "$path" 2>/dev/null; then
+        continue
+      fi
+
+      parent_dir="$path"
+      skip=false
+      while [[ "$parent_dir" != "." && "$parent_dir" != "/" && -n "$parent_dir" ]]; do
+        parent_dir=$(dirname "$parent_dir")
+        [[ "$parent_dir" == "." || "$parent_dir" == "/" ]] && break
+        if is_dir_ignored_yaml "$(basename "$parent_dir")"; then
+          skip=true
+          break
+        fi
+      done
+      [[ "$skip" == true ]] && continue
+    fi
+
+    changed_files+=( "$path" )
+  done < <(cd "$GIT_ROOT" && {
+    if [[ "$has_head" == true ]]; then
+      if (( ${#raw_inputs[@]} > 0 )); then
+        git diff --name-only HEAD -- "${raw_inputs[@]}"
+      else
+        git diff --name-only HEAD
+      fi
+    else
+      if (( ${#raw_inputs[@]} > 0 )); then
+        git diff --name-only --cached -- "${raw_inputs[@]}"
+        git diff --name-only -- "${raw_inputs[@]}"
+      else
+        git diff --name-only --cached
+        git diff --name-only
+      fi
+    fi
+
+    if (( ${#raw_inputs[@]} > 0 )); then
+      git ls-files --others --exclude-standard -- "${raw_inputs[@]}"
+    else
+      git ls-files --others --exclude-standard
+    fi
+  } | sort -u)
+
+  if (( ${#changed_files[@]} == 0 )); then
+    if (( ${#raw_inputs[@]} > 0 )); then
+      printf "%s\n" "${CLR_WARN}No files changed since the last commit for the selected targets.${RESET}" >&2
+    else
+      printf "%s\n" "${CLR_WARN}No files changed since the last commit.${RESET}" >&2
+    fi
+    exit 0
+  fi
+
+  raw_inputs=( "${changed_files[@]}" )
+fi
+
+(( ${#raw_inputs[@]} == 0 )) && raw_inputs=( "." )
 
 file_targets=()
 dir_targets=()
@@ -1529,28 +1655,37 @@ awk -v warn="$CLR_WARN" -v reset="$RESET" '
 # Use eval to handle multi-word clipboard commands (e.g., "xclip -selection clipboard")
 # This is safe because CLIPBOARD_CMD is set internally, not from user input
 if [[ "$USE_CLIPBOARD" == true ]]; then
+  clipboard_ok=true
   if ! eval "$CLIPBOARD_CMD" < "$TMPFILE" 2>/dev/null; then
-    printf "\n${CLR_ERROR}✗ Clipboard copy failed!${RESET}\n" >&2
-    printf "${DIM}The clipboard tool '${CLIPBOARD_CMD%% *}' could not copy the content.${RESET}\n" >&2
-    
-    # Provide platform-specific guidance
-    case "$OS_TYPE" in
-      linux)
-        if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-          printf "${CLR_WARN}You appear to be on Wayland. Install wl-clipboard:${RESET}\n" >&2
-          printf "  sudo apt install wl-clipboard  ${DIM}# Ubuntu/Debian${RESET}\n" >&2
-        else
-          printf "${CLR_WARN}Try installing xclip:${RESET}\n" >&2
-          printf "  sudo apt install xclip  ${DIM}# Ubuntu/Debian${RESET}\n" >&2
-        fi
-        ;;
-    esac
-    
-    printf "\n${DIM}Alternatively, use --print to output to terminal:${RESET}\n" >&2
-    printf "  catclip --print > output.txt\n" >&2
-    exit 1
+    if [[ "$PRINT_CONTENT" == true ]]; then
+      clipboard_ok=false
+      printf "\n${CLR_WARN}⚠ Clipboard copy failed; continuing with --print output.${RESET}\n" >&2
+      printf "${DIM}The clipboard tool '${CLIPBOARD_CMD%% *}' could not copy the content.${RESET}\n" >&2
+    else
+      printf "\n${CLR_ERROR}✗ Clipboard copy failed!${RESET}\n" >&2
+      printf "${DIM}The clipboard tool '${CLIPBOARD_CMD%% *}' could not copy the content.${RESET}\n" >&2
+      
+      # Provide platform-specific guidance
+      case "$OS_TYPE" in
+        linux)
+          if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+            printf "${CLR_WARN}You appear to be on Wayland. Install wl-clipboard:${RESET}\n" >&2
+            printf "  sudo apt install wl-clipboard  ${DIM}# Ubuntu/Debian${RESET}\n" >&2
+          else
+            printf "${CLR_WARN}Try installing xclip:${RESET}\n" >&2
+            printf "  sudo apt install xclip  ${DIM}# Ubuntu/Debian${RESET}\n" >&2
+          fi
+          ;;
+      esac
+      
+      printf "\n${DIM}Alternatively, use --print to output to terminal:${RESET}\n" >&2
+      printf "  catclip --print > output.txt\n" >&2
+      exit 1
+    fi
   fi
-  printf "\n${CLR_SUCCESS}✔${RESET} ${BOLD}Copied to clipboard!${RESET}\n" >&2
+  if [[ "$clipboard_ok" == true ]]; then
+    printf "\n${CLR_SUCCESS}✔${RESET} ${BOLD}Copied to clipboard!${RESET}\n" >&2
+  fi
 fi
 
 if [[ "$PRINT_CONTENT" == true ]]; then

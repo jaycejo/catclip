@@ -4,34 +4,19 @@ One command to copy your entire codebase to clipboard for AI assistants.
 ```bash
 catclip src  # That's it.
 ```
-
-**Why?** Born from the frustration of:
-
-🫩 manual copy‑pasting across folders  
-😵‍💫 one‑off commands that aren’t recursive  
-😫 commands too long or fiddly to repeat consistently  
-🫣 accidentally including binaries or huge artifacts  
-😱 paths breaking on spaces or weird characters  
-🫥 missing hidden files or sibling folders
-
-...
-
-*You name it.*
-
-All **solved** with `catclip`.
-
 ---
 
 ## Features
 
-- 🔍 Fuzzy search - `catclip components` finds any nested directory
-- 🔗 Chained paths - `catclip shared/components` more specific in case there are multiple `components` directories
-- 🧠 Fast exact paths - `catclip src/components/ui/Button.tsx` is perfect with tab-tab completion
-- 🧩 Multiple targets - `catclip README.md src docs` in one run
-- 🧾 File headers in output - each file is prefixed with `# File: path/to/file`
-- 🛡️ Secret protection - Blocks `.env`, keys, credentials
-- 🌳 Visual preview - Tree view before copying
-- 🙈 Git-aware - Respects `.gitignore`
+- ⚡ **Instant** - Zero setup, smart defaults, copies 500+ files in seconds
+- 🔍 **Fuzzy search** - `catclip components` finds any nested directory
+- 🔗 **Chained paths** - `catclip shared/components` more specific in case there are multiple `components` directories
+- 🧩 **Multiple targets** - `catclip README.md src docs` in one run
+- 🧾 **File headers in output** - each file is prefixed with `# File: path/to/file`
+- 🌳 **Visual preview** - Tree view with file count, size, and token estimate before copying
+- 🙈 **Git-aware** - Respects `.gitignore` and supports diff-only context with `--changed`
+- 🎛️ **Flexible ignores** - `--ignore +'*.css' d-build` for one-off changes, or `--ignore-always` to persist
+- 🛡️ **Secret protection** - Blocks `.env`, keys, credentials
 
 ---
 
@@ -100,6 +85,12 @@ cd dummy-react-project
 catclip components          # Copy directory
 catclip layout/Sidebar.tsx  # Copy file
 ```
+\
+You don't even have to type the full directory name, `com` is enough:
+
+<img width="1300" height="835" alt="image" src="https://github.com/user-attachments/assets/c2d2fb10-310a-4cd6-aa6d-d5bea0fbf2d0" />
+
+
 
 ---
 
@@ -137,6 +128,13 @@ catclip src/features/authentication --ignore +'LoginForm.tsx'
 
 </details>
 
+## Changed files (Git only)
+```
+catclip --changed
+catclip src --changed
+```
+Copies only the files that differ from `HEAD`, including staged changes and untracked files. Runs only inside a Git repository. Optional targets limit the scope (for example, `src` only).
+
 ---
 
 ## Configuration
@@ -158,6 +156,7 @@ Adds `*.log` and `build/`, removes `old.tmp` and `src/` from **ignore list**
 
 Tip: Use `--ignore` with targets to apply changes for this run only:
 `catclip src --ignore +'main.tsx'`
+If you omit targets, `catclip` defaults to current directory (`.`).
 
 ---
 
@@ -174,6 +173,7 @@ Tip: Use `--ignore` with targets to apply changes for this run only:
 | `-r`, `--reset-config` | Restore default ignore config |
 | `-i`, `--ignore <ops>` | Temporary ignores for this run only |
 | `--ignore-always <ops>` | Modify ignore list |
+| `--changed` | Copy files changed since the last commit (requires Git repo; optional targets scope results). |
 
 Full docs: `catclip --help`
 
