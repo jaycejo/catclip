@@ -12,10 +12,10 @@ catclip src  # That's it.
 - 🔍 **Fuzzy search** - `catclip components` finds any nested directory
 - 🔗 **Chained paths** - `catclip shared/components` more specific in case there are multiple `components` directories
 - 🧩 **Multiple targets** - `catclip README.md src docs` in one run
-- 🧾 **File headers in output** - each file is prefixed with `# File: path/to/file`
+- 🧾 **File headers in output** - each file is wrapped in `<file path="path/to/file">` tags
 - 🌳 **Visual preview** - Tree view with file count, size, and token estimate before copying
 - 🙈 **Git-aware** - Respects `.gitignore` and supports diff-only context with `--changed`
-- 🎛️ **Flexible ignores** - `--ignore +'*.css' d-build` for one-off changes, or `--ignore-always` to persist
+- 🎛️ **Flexible ignores** - `--exclude "*.css"` to skip, `--include "tests/"` to restore, `--include "*"` to disable all rules
 - 🛡️ **Secret protection** - Blocks `.env`, keys, credentials
 
 ---
@@ -46,20 +46,20 @@ PREFIX="${PREFIX:-/usr/local}"
 BIN_DIR="$PREFIX/bin"
 SHARE_DIR="$PREFIX/share/catclip"
 
-mkdir -p "$BIN_DIR" "$SHARE_DIR" ~/.config/catclip
+mkdir -p "$BIN_DIR" "$SHARE_DIR"
 cp catclip "$BIN_DIR/"
 cp VERSION "$SHARE_DIR/VERSION"
-cp ignore.yaml ~/.config/catclip/ignore.yaml
 ```
 
 If you prefer a user-local install (no sudo):
 ```bash
 PREFIX="$HOME/.local"
-mkdir -p "$PREFIX/bin" "$PREFIX/share/catclip" ~/.config/catclip
+mkdir -p "$PREFIX/bin" "$PREFIX/share/catclip"
 cp catclip "$PREFIX/bin/"
 cp VERSION "$PREFIX/share/catclip/VERSION"
-cp ignore.yaml ~/.config/catclip/ignore.yaml
 ```
+
+The global config (`~/.config/catclip/.hiss`) is created automatically on first run.
 </details>
 
 <details><summary>Updating & Uninstalling</summary>
@@ -116,14 +116,20 @@ catclip README.md src docs
 <summary><b>More Examples</b></summary>
 
 ```bash
-# Override filters:
-catclip --no-ignore dist
+# Remove rules for this run (include tests):
+catclip . --include "tests/,*.test.ts"
 
-# Copy & Print to stdout:
+# Disable all ignore rules (full scan):
+catclip . --include "*"
+
+# Output to screen (stdout) instead of clipboard:
 catclip --print src
 
-# Temporary ignore (this run only):
-catclip src/features/authentication --ignore +'LoginForm.tsx'
+# Preview what would be copied (fast dry-run):
+catclip src --preview
+
+# Skip files (this run only):
+catclip src --exclude "LoginForm.tsx"
 ```
 
 </details>
@@ -135,28 +141,44 @@ catclip src --changed
 ```
 Copies only the files that differ from `HEAD`, including staged changes and untracked files. Runs only inside a Git repository. Optional targets limit the scope (for example, `src` only).
 
+## Scopes
+Use `--then` to apply different modifiers to different targets:
+```bash
+catclip src --only "*.ts" --then tests --only "*.test.ts"
+#   Scope 1: src/ — only TypeScript source files
+#   Scope 2: tests/ — only test files
+```
+Without `--then`, all targets share the same modifiers:
+```bash
+catclip src lib --only "*.ts"   # Both filtered to .ts files
+```
+
 ---
 
 ## Configuration
 
-Default location: `~/.config/catclip/ignore.yaml`
-```yaml
-ignore_dirs:
-  - node_modules
-  - .git
-ignore_files:
-  - '*.log'
-  - .env
+catclip uses `~/.config/catclip/.hiss` (gitignore-inspired syntax, created on first run) plus `.gitignore` in Git repos.
+
+```
+# Example .hiss file (trailing / = directory)
+node_modules/
+*.log
+.env
 ```
 
-Quick config:
-`catclip --ignore-always +'*.log' -'old.tmp' d+build d-src`
+Edit config:
+```bash
+catclip --hiss             # open ignore config in editor
+catclip --hiss-reset       # restore defaults
+```
 
-Adds `*.log` and `build/`, removes `old.tmp` and `src/` from **ignore list**
-
-Tip: Use `--ignore` with targets to apply changes for this run only:
-`catclip src --ignore +'main.tsx'`
-If you omit targets, `catclip` defaults to current directory (`.`).
+For this run only:
+```bash
+catclip src --exclude "*.test.*"           # skip test files
+catclip . --include ".env"                 # remove .env rule, then discover
+catclip . --include "*"                    # disable all ignore rules (full scan)
+catclip src --include "tests/" --exclude "*.snap"  # combine both
+```
 
 ---
 
@@ -166,14 +188,18 @@ If you omit targets, `catclip` defaults to current directory (`.`).
 |------|-------------|
 | `-h`, `--help` | Show help |
 | `-y`, `--yes` | Skip confirmation |
-| `-n`, `--no-ignore` | Include ignored files |
-| `-p`, `--print` | Print to terminal in addition to clipboard |
-| `-l`, `--list-ignores` | Show ignore rules |
+| `-q`, `--quiet` | Suppress all informational output (errors only) |
+| `-v`, `--verbose` | Show phase timings and debug info |
+| `--include RULES` | Remove rules from blocklist this run (comma-separated; `"*"` = all) |
+| `--exclude GLOBS` | Add skip rules this run (comma-separated; trailing `/` = directory) |
+| `-p`, `--print` | Output to screen (stdout) instead of clipboard |
+| `--hiss` | Open ignore config in editor |
 | `-t`, `--no-tree` | Skip tree rendering |
-| `-r`, `--reset-config` | Restore default ignore config |
-| `-i`, `--ignore <ops>` | Temporary ignores for this run only |
-| `--ignore-always <ops>` | Modify ignore list |
+| `--hiss-reset` | Restore default ignore config |
+| `--only GLOB` | Include only files matching shell glob (OR across repeats) |
 | `--changed` | Copy files changed since the last commit (requires Git repo; optional targets scope results). |
+| `--then` | Start a new scope (separate targets with different modifiers) |
+| `--preview` | Show file tree and token count without copying |
 
 Full docs: `catclip --help`
 
@@ -195,17 +221,16 @@ sudo dnf install xclip # or wl-clipboard for Wayland
 # Arch
 sudo pacman -S xclip # or wl-clipboard for Wayland
 ```
-Or fallback to stdout: `catclip --print src > code.txt`
+Or output to screen (stdout): `catclip --print src > code.txt`
 
 </details>
 
 <details>
 <summary><b>Directory ignored</b></summary>
 
-Check: `catclip --list-ignores`
-Bypass once: `catclip --no-ignore name`
-or
-Permanently un-ignore: `catclip --ignore-always d-name`
+Check: `catclip --hiss`
+Include this run: `catclip . --include "name/"` or `catclip . --include "*"`
+Remove permanently: `catclip --hiss` (delete the line from the config)
 
 </details>
 

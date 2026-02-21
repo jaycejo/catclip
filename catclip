@@ -1,36 +1,43 @@
 #!/usr/bin/env bash
-# ------------------------------------------------------------------------------
-# catclip - Context Gatherer for LLMs
+# ==============================================================================
+# catclip — Context Gatherer for LLMs
 #
-# Copies code files to clipboard with "# File: path" headers for AI prompts.
+# Copies code files to clipboard with "<file path=\"path\">" tags for AI prompts.
 # Filters secrets, binaries, and build artifacts by default.
 #
-# DESIGN PHILOSOPHY:
-# 1. Safety First: Don't leak secrets (.env) or junk (node_modules) by default.
-# 2. Native Dependencies: Use standard tools (awk, find, git) to avoid npm/pip.
-# 3. Git-Aware: Use 'git ls-files' as source of truth when in a repo.
-# 4. Self-Healing: Embedded defaults restore config if missing/broken.
-# 5. Speed: Extension checks before 'file' command, batch operations.
-# 6. Bash 3.2: macOS ships old bash; avoid associative arrays, mapfile, |&.
-# ------------------------------------------------------------------------------
+# EXIT CODES:
+#   0  Success
+#   1  Runtime error (no files found, clipboard failure, config corruption)
+#   2  Usage error (bad arguments, invalid paths)
+#
+# DESIGN:
+#   1. Safety First    — Secrets (.env, *.pem) and junk (node_modules) excluded
+#   2. Git-Aware       — Uses git ls-files + .gitignore when in a repo
+#   3. Zero Deps       — Only bash, awk, find, file, git (optional)
+#   4. Bash 3.2        — macOS ships old bash; no associative arrays, no mapfile
+#   5. Fast            — Extension allow/block lists, batch file(1), batch git ops
+# ==============================================================================
 
-# SAFETY BOILERPLATE
-# set -e: Exit on command failure (fail-fast).
-# set -u: Error on unset variables (prevents rm -rf / bugs).
-# set -o pipefail: Fail if any pipeline command fails.
+# NOTE: set -e interacts poorly with functions that intentionally return
+# non-zero (e.g. _mime_cache_lookup). Such calls MUST remain inside
+# conditionals (if/||/&&) to prevent silent exits. Test after refactoring.
 set -euo pipefail
 
-# IFS: Only split on newline/tab, not space. Preserves filenames with spaces.
+# IFS=$'\n\t' globally: split on newline/tab only, never space.
+# This preserves filenames with spaces everywhere. Functions that need
+# different splitting use inline IFS= or IFS=',' on the read call.
 IFS=$'\n\t'
 
-# 0) TERMINAL CONFIGURATION
-# Force 256-color mode for consistent output in restricted shells.
+# Save original arguments for exec-on-retry (config reset path).
+ORIG_ARGS=("$@")
+
+# ==============================================================================
+# PLATFORM & PREREQUISITES
+# ==============================================================================
+
 export TERM="${TERM:-xterm-256color}"
 
-# 0.5) OS DETECTION
-# Detect OS once at startup for platform-specific behavior.
-# WSL detected via /proc/version (contains "Microsoft" or "WSL").
-detect_os() {
+detect_platform() {
   case "$(uname -s)" in
     Darwin) echo "macos" ;;
     Linux)
@@ -40,134 +47,31 @@ detect_os() {
         echo "linux"
       fi
       ;;
-    CYGWIN*|MINGW*|MSYS*) echo "wsl" ;;  # Treat Cygwin/MinGW as WSL-like
+    CYGWIN*|MINGW*|MSYS*) echo "wsl" ;;
     *) echo "unknown" ;;
   esac
 }
-OS_TYPE="$(detect_os)"
 
-# 1) PREREQUISITE CHECKS
-# Fail fast if essential tools are missing. Git and clipboard checked separately.
+PLATFORM="$(detect_platform)"
+
 for cmd in find mktemp awk file; do
   if ! command -v "$cmd" &>/dev/null; then
-    echo "Error: '$cmd' is required but not found in PATH." >&2
+    printf "Error: '%s' is required but not found in PATH.\n" "$cmd" >&2
+    printf "  This is a core system tool. Check your PATH or install it.\n" >&2
     exit 1
   fi
 done
 
-# Check for git (optional - enables .gitignore support)
 HAS_GIT=false
-if command -v git &>/dev/null; then
-  HAS_GIT=true
-fi
+command -v git &>/dev/null && HAS_GIT=true
 
-# 1.5) CLIPBOARD DETECTION
-# Detect available clipboard command based on OS and display server.
-# Session-aware: wl-copy only on Wayland, xclip/xsel only on X11.
-detect_clipboard_cmd() {
-  case "$OS_TYPE" in
-    macos)
-      if command -v pbcopy &>/dev/null; then
-        echo "pbcopy"
-        return 0
-      fi
-      ;;
-    wsl)
-      # WSL: prefer clip.exe for direct Windows clipboard
-      if command -v clip.exe &>/dev/null; then
-        echo "clip.exe"
-        return 0
-      fi
-      ;;
-  esac
-  
-  # Linux: detect display server and use appropriate tool
-  local is_wayland=false
-  if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-    is_wayland=true
-  fi
-  
-  if [[ "$is_wayland" == true ]]; then
-    # Wayland: prefer wl-copy, fall back to xclip/xsel (via XWayland)
-    if command -v wl-copy &>/dev/null; then
-      echo "wl-copy"
-      return 0
-    elif command -v xclip &>/dev/null; then
-      echo "xclip -selection clipboard"
-      return 0
-    elif command -v xsel &>/dev/null; then
-      echo "xsel --clipboard --input"
-      return 0
-    fi
-  else
-    # X11: prefer xclip/xsel, skip wl-copy (it won't work)
-    if command -v xclip &>/dev/null; then
-      echo "xclip -selection clipboard"
-      return 0
-    elif command -v xsel &>/dev/null; then
-      echo "xsel --clipboard --input"
-      return 0
-    fi
-  fi
-  
-  return 1
-}
+# ==============================================================================
+# VERSION
+# ==============================================================================
 
-# 2) COLORS & THEME
-# ANSI escape codes. Semantic naming (CLR_ERROR vs RED) for self-documenting code.
-RESET=$'\033[0m'
-BOLD=$'\033[1m'
-DIM=$'\033[2m'
-CYAN=$'\033[36m'
-GREEN=$'\033[32m'
-YELLOW=$'\033[33m'
-RED=$'\033[31m'
-
-# Semantic aliases for themed output
-CLR_SUCCESS=$'\033[32m'
-CLR_ERROR=$'\033[31m'
-CLR_WARN=$'\033[33m'
-CLR_DIR=$'\033[1;34m'
-CLR_LABEL=$'\033[90m'
-CLR_VALUE=$'\033[1m'
-CLR_TREE=$'\033[90m'
-CLR_PROMPT=$'\033[36m'
-CLR_GIT=$'\033[35m'
-
-# Prompt for y/n with a default without failing in non-interactive contexts.
-# Sets PROMPT_RESPONSE to "y" or "n" (lowercase).
-prompt_yn() {
-  local prompt="$1"
-  local default="$2" # "y" or "n"
-  PROMPT_RESPONSE="$default"
-
-  # Preferred: if stdout or stderr is a TTY, prompt there.
-  if [[ -t 1 || -t 2 ]]; then
-    printf "%s" "$prompt" >&2
-    read -r -n 1 PROMPT_RESPONSE 2>/dev/null || PROMPT_RESPONSE="$default"
-    echo >&2
-  # Fallback: /dev/tty (may not exist in some contexts)
-  elif [[ -r /dev/tty ]]; then
-    if printf "%s" "$prompt" > /dev/tty 2>/dev/null; then
-      read -r -n 1 PROMPT_RESPONSE < /dev/tty 2>/dev/null || PROMPT_RESPONSE="$default"
-      printf "\n" >&2
-    fi
-  fi
-
-  if [[ -z "$PROMPT_RESPONSE" ]]; then
-    PROMPT_RESPONSE="$default"
-  fi
-  PROMPT_RESPONSE=$(printf "%s" "$PROMPT_RESPONSE" | tr 'A-Z' 'a-z')
-}
-
-# 3) CONFIGURATION MANAGEMENT
-# XDG Base Directory spec: ~/.config/catclip/ignore.yaml
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/catclip"
-CONFIG="$CONFIG_DIR/ignore.yaml"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SHARE_DIR="$PREFIX_DIR/share/catclip"
-SHARE_TEMPLATE="$SHARE_DIR/ignore.yaml"
 VERSION="dev"
 if [[ -f "$SHARE_DIR/VERSION" ]]; then
   VERSION="$(tr -d ' \t\r\n' < "$SHARE_DIR/VERSION")"
@@ -178,1516 +82,1929 @@ if [[ -n "${CATCLIP_VERSION:-}" ]]; then
   VERSION="$CATCLIP_VERSION"
 fi
 
-# EMBEDDED DEFAULTS (The "Factory Reset" State)
+# ==============================================================================
+# COLORS
+#
+# Semantic names — never raw escape codes in logic.
+# Respects NO_COLOR (https://no-color.org) and non-TTY stderr.
+# ==============================================================================
 
-get_default_config() {
-  cat <<'EOF'
-ignore_dirs:
-  # Version Control
-  - .git
-  - .svn
-  - .hg
-  
-  # IDEs & Editors
-  - .idea
-  - .vscode
-  - .cursor
-  - .history
-  
-  # JavaScript / Node
-  - node_modules
-  - bower_components
-  - jspm_packages
-  - coverage
-  - .npm
-  - .yarn
-  - .pnpm-store
-  
-  # Python
-  - __pycache__
-  - venv
-  - .venv
-  - env
-  - .pytest_cache
-  - .mypy_cache
-  - .tox
-  - htmlcov
-  
-  # Java / Build
-  - target
-  - build
-  - dist
-  - out
-  - bin
-  - obj
-  - .gradle
-  
-  # Web Frameworks
-  - .next
-  - .nuxt
-  - .serverless
-  - .turbo
-  
-  # Test directories
-  - test
-  - tests
-  - __tests__
-  - fixtures
-  - __fixtures__
+setup_colors() {
+  if [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 2 ]]; then
+    RESET="" BOLD="" DIM=""
+    C_OK="" C_ERR="" C_WARN="" C_DIR=""
+    C_LABEL="" C_VALUE="" C_TREE="" C_PROMPT="" C_GIT=""
+  else
+    RESET=$'\033[0m'
+    BOLD=$'\033[1m'
+    DIM=$'\033[2m'
+    C_OK=$'\033[32m'
+    C_ERR=$'\033[31m'
+    C_WARN=$'\033[33m'
+    C_DIR=$'\033[1;34m'
+    C_LABEL=$'\033[90m'
+    C_VALUE=$'\033[1m'
+    C_TREE=$'\033[90m'
+    C_PROMPT=$'\033[36m'
+    C_GIT=$'\033[35m'
+  fi
+}
+setup_colors
 
-ignore_files:
-  # System Files
-  - .DS_Store
-  - .AppleDouble
-  - .LSOverride
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
 
-  # Lockfiles (Text but Noisy - use --no-ignore if needed)
-  - package-lock.json
-  - yarn.lock
-  - pnpm-lock.yaml
-  - poetry.lock
-  - Pipfile.lock
-  - Gemfile.lock
-  - composer.lock
-  - Cargo.lock
-  - go.sum
-  
-  # Secrets (CRITICAL - Never leak)
-  - .env
-  - .env.local
-  - .env.*
-  - "*.pem"
-  - "*.key"
-  - "*.p12"
-  - "*.pfx"
-  - id_rsa
-  - id_ed25519
-  - application.properties
-  - application.yml
-  - secrets.yaml
-  - credentials.json
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/catclip"
+GLOBAL_HISS="$CONFIG_DIR/.hiss"
 
-  # Logs & Temp
-  - "*.log"
-  - "*.tmp"
-  - "*.bak"
-  - "*.swp"
-  - "*.swo"
-EOF
+get_default_hiss() {
+  cat <<'DEFAULTS'
+# catclip ignore config — gitignore-style syntax
+#
+# test/test.js  → specific file in specific directory
+# *.test.js     → pattern, matches anywhere
+# test/         → directory (trailing slash)
+# test          → file named test
+#
+# Edit with: catclip --hiss
+
+# Secrets (never leak these)
+.env
+.env.local
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+application.properties
+application.yml
+secrets.yaml
+credentials.json
+
+# Version Control
+.git/
+.svn/
+.hg/
+
+# System / Junk
+.DS_Store
+.AppleDouble
+.LSOverride
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# IDEs & Editors
+.idea/
+.vscode/
+.cursor/
+.history/
+
+# JavaScript / Node
+node_modules/
+bower_components/
+jspm_packages/
+coverage/
+.npm/
+.yarn/
+.pnpm-store/
+
+# Python
+__pycache__/
+venv/
+.venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.tox/
+htmlcov/
+
+# Java / Build
+target/
+build/
+dist/
+out/
+bin/
+obj/
+.gradle/
+
+# Web Frameworks
+.next/
+.nuxt/
+.serverless/
+.turbo/
+
+# Test directories (remove these lines to include tests)
+test/
+tests/
+__tests__/
+fixtures/
+__fixtures__/
+
+# Lockfiles
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+poetry.lock
+Pipfile.lock
+Gemfile.lock
+composer.lock
+Cargo.lock
+go.sum
+DEFAULTS
 }
 
-# Check if config exists, prompt to create if missing
-if [[ ! -f "$CONFIG" ]]; then
-  printf "\n%s\n" "${CLR_WARN}Config Not Found: ${BOLD}$CONFIG${RESET}" >&2
-  printf "%s\n" "${DIM}No ignore configuration exists.${RESET}" >&2
-  prompt_yn $'\n'"${CLR_WARN}Would you like to create default configuration? [Y/n]${RESET} " "y"
-  if [[ "$PROMPT_RESPONSE" == "n" ]]; then
-    echo "${CLR_WARN}Continuing without ignore rules (all text files will be included)...${RESET}" >&2
-  else
-    mkdir -p "$CONFIG_DIR"
-    if [[ -f "$SHARE_TEMPLATE" ]]; then
-      cp "$SHARE_TEMPLATE" "$CONFIG"
-      echo "${CLR_SUCCESS}Default configuration copied from ${BOLD}$SHARE_TEMPLATE${RESET}" >&2
-    else
-      get_default_config > "$CONFIG"
-      echo "${CLR_SUCCESS}Default configuration created at ${BOLD}$CONFIG${RESET}" >&2
-    fi
-  fi
-fi
+# ==============================================================================
+# CLEANUP & TEMP FILE MANAGEMENT
+#
+# Single temp directory — one rm -rf on exit cleans everything.
+# No unbounded array, no per-file tracking.
+# ==============================================================================
 
-# 4) CLEANUP TRAPS
-TMPFILE=""
-LISTFILE=""
-UTF16_LIST=""
+TMPDIR_CATCLIP=$(mktemp -d) || { printf "Error: Cannot create temp directory.\n" >&2; exit 1; }
+
+mktmp() {
+  # mktemp inside the shared temp dir — each call creates a unique file.
+  # Cannot use a counter because mktmp is called via $() (subshell).
+  mktemp "$TMPDIR_CATCLIP/tmp.XXXXXX"
+}
+
 cleanup() {
-  [[ -n "$TMPFILE" && -f "$TMPFILE" ]] && rm -f "$TMPFILE"
-  [[ -n "$LISTFILE" && -f "$LISTFILE" ]] && rm -f "$LISTFILE"
-  [[ -n "$UTF16_LIST" && -f "$UTF16_LIST" ]] && rm -f "$UTF16_LIST"
-  : # Ensure trap returns 0
+  [[ -d "$TMPDIR_CATCLIP" ]] && rm -rf "$TMPDIR_CATCLIP"
 }
 trap cleanup EXIT
 
-# 5) HELPER FUNCTIONS
+# ==============================================================================
+# VERBOSE / TIMING
+#
+# --verbose (-v) enables phase timings and debug output on stderr.
+# Uses $SECONDS (built-in, integer resolution) — good enough for phases.
+# ==============================================================================
 
-format_size() {
-  awk -v b="$1" 'BEGIN {
-    split("B KB MB GB TB", units);
-    u=1;
-    while(b >= 1024 && u < 5) { b/=1024; u++ }
-    printf "%.2f%s", b, units[u]
+VERBOSE=false
+QUIET=false
+
+vlog() {
+  [[ "$VERBOSE" == true ]] || return 0
+  printf "${C_LABEL}[verbose]${RESET} %s\n" "$*" >&2
+}
+
+# Informational output — suppressed by --quiet.
+# Errors (exit 1/2) always go to stderr unconditionally.
+# SAFETY: First argument is a printf format string. All call sites MUST
+# pass a literal format — never user-controlled data as the first arg.
+info() {
+  [[ "$QUIET" == true ]] && return 0
+  printf "$@" >&2
+}
+
+timer_start() { echo "$SECONDS"; }
+
+timer_end() {
+  local start="$1" label="$2"
+  vlog "$label: $((SECONDS - start))s"
+}
+
+# ==============================================================================
+# UTILITY FUNCTIONS (pure — no global mutation)
+# ==============================================================================
+
+prompt_yn() {
+  local prompt="$1" default="$2" response=""
+
+  if [[ -t 1 || -t 2 ]]; then
+    printf "%s " "$prompt" >&2
+    read -r -n 1 response 2>/dev/null || response="$default"
+    echo >&2
+  elif [[ -r /dev/tty ]]; then
+    printf "%s " "$prompt" > /dev/tty 2>/dev/null || true
+    read -r -n 1 response < /dev/tty 2>/dev/null || response="$default"
+    echo >&2
+  else
+    response="$default"
+  fi
+
+  [[ -z "$response" ]] && response="$default"
+  response=$(printf "%s" "$response" | tr 'A-Z' 'a-z')
+  [[ "$response" == "y" ]]
+}
+
+# [Point 11] Compute human-readable size and token estimate in one awk call.
+# Accepts bytes + file count on stdin as "bytes filecount", prints "size tokens".
+format_size_and_tokens() {
+  awk -v b="$1" -v fc="$2" 'BEGIN {
+    b += fc * 30
+    tokens = int(b / 4)
+    split("B KB MB GB TB", u); i=1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    printf "%.2f%s %d\n", b, u[i], tokens
   }'
 }
 
-# Cross-platform file size in bytes. macOS uses -f %z, Linux uses -c %s.
 get_file_size() {
-  local f="$1"
-  local size
-  case "$OS_TYPE" in
-    macos) size=$(stat -f %z "$f" 2>/dev/null) ;;
-    *)     size=$(stat -c %s "$f" 2>/dev/null) ;;
+  case "$PLATFORM" in
+    macos) stat -f %z "$1" 2>/dev/null || echo 0 ;;
+    *)     stat -c %s "$1" 2>/dev/null || echo 0 ;;
   esac
-  # Ensure we always return a number
-  echo "${size:-0}"
 }
 
-print_tree() {
-  local list_file="$1"
-  sort "$list_file" | awk -v dir_col="$CLR_DIR" -v reset="$RESET" -v tree_col="$CLR_TREE" -F/ '
+# [Point 12] Count lines without wc padding issues.
+count_lines() {
+  awk 'END{print NR}' "$1"
+}
+
+# "file" or "files" based on count.
+plural() {
+  if (( $1 == 1 )); then echo "file"; else echo "files"; fi
+}
+
+# Replace $HOME with ~ for display.
+short_path() {
+  local p="$1"
+  case "$p" in "$HOME"*) echo "~${p#"$HOME"}" ;; *) echo "$p" ;; esac
+}
+
+# ==============================================================================
+# BINARY DETECTION
+#
+# Three tiers:
+#   1. Hard-block extensions (binary — instant reject)
+#   2. Known-text extensions (instant accept, skips file(1) entirely)
+#   3. file(1) fallback with per-extension cache
+#
+# For bulk classification, use batch_classify_files (one file(1) fork for all
+# unknown-extension files). is_text_file is used for single-file checks only.
+# ==============================================================================
+
+# [Point 2] String-match cache instead of parallel array scan.
+# O(n) substring search, but avoids per-element loop overhead and
+# stays Bash 3.2 compatible (no associative arrays).
+_mime_cache=""
+
+_mime_cache_lookup() {
+  case " $_mime_cache " in
+    *" $1=text "*)   echo "text"; return 0 ;;
+    *" $1=binary "*) echo "binary"; return 0 ;;
+  esac
+  return 1
+}
+
+_mime_cache_add() {
+  _mime_cache="$_mime_cache $1=$2"
+}
+
+# Extension / basename classification strings — single source of truth.
+# Space-delimited so bash can match via case " $LIST " in *" $val "*)
+# and awk can split() into a hash table for batch classification.
+# (Leading spaces on continued lines prevent words from running together
+# if an editor auto-trims trailing whitespace).
+
+BINARY_BASENAMES=".ds_store thumbs.db"
+
+TEXT_BASENAMES="makefile gemfile rakefile guardfile vagrantfile berksfile capfile \
+ dockerfile containerfile jenkinsfile procfile \
+ cmakelists.txt configure configure.ac \
+ .gitignore .gitattributes .gitmodules .gitkeep .keep \
+ .git-blame-ignore-revs \
+ .dockerignore .helmignore .slugignore \
+ .vscodeignore .npmignore .eslintignore \
+ .editorconfig .eslintrc .prettierrc .stylelintrc \
+ .babelrc .npmrc .yarnrc .nvmrc .browserslistrc \
+ .flake8 .pylintrc .rubocop.yml \
+ .htaccess .mailmap .sequelizerc \
+ license licence authors contributors changelog todo \
+ codeowners version readme"
+
+BINARY_EXTS="png jpg jpeg gif bmp ico svg webp tif tiff psd xcf heic raw \
+ pdf docx doc xlsx xls pptx ppt odt ods odp rtf \
+ zip tar gz bz2 xz 7z rar dmg iso img vmdk qcow2 \
+ exe dll so dylib a lib o obj pdb \
+ class jar war ear pyc pyo pyd wasm beam rlib \
+ apk aab ipa msi cab deb rpm \
+ pt pth ckpt safetensors onnx gguf h5 pkl parquet arrow \
+ mp3 mp4 mov avi mkv webm flv wmv m4a wav flac ogg 3gp \
+ ttf otf woff woff2 eot \
+ blend glb fbx 3ds \
+ db sqlite sqlite3 bin dat hex dump map lockb \
+ pack eslintcache \
+ icns xpm scpt"
+
+TEXT_EXTS="html htm css scss sass less js jsx mjs cjs ts tsx mts cts \
+ json yaml yml xml toml ini cfg conf properties env lock \
+ md markdown txt text rst adoc \
+ py pyw pyi ipynb rb erb haml pl pm lua sh bash zsh fish bat cmd ps1 psm1 psd1 \
+ c cc cpp cxx h hh hpp hxx go rs swift kt kts scala cs fs vb vbs java jsp php sql \
+ gd godot shader unity qml \
+ mk cmake gradle \
+ groovy gvy tf hcl \
+ sln csproj vbproj fsproj \
+ r rmd clj cljs ex exs erl hrl elm nim zig v d m mm \
+ hs lhs jl cl lisp scm ss rkt asm s \
+ csv tsv graphql gql proto sol patch diff \
+ vim dart vue svelte astro tex j2 ejs hbs mustache liquid pug jade \
+ tsbuildinfo info local development production staging test example \
+ log out err pid seed snap \
+ code-snippets code-workspace tmLanguage \
+ desktop template spec ps1xml"
+
+# Extension classification result:
+#   "binary" = tier 1 hard block
+#   "text"   = tier 2 known text
+#   ""       = unknown, needs file(1)
+# Both _classify_basename and _classify_ext are ALWAYS called via $()
+# (command substitution = subshell). shopt changes die with the subshell,
+# so nocasematch cannot leak to the parent. No manual shopt -u needed.
+
+_classify_basename() {
+  local base="$1"
+  shopt -s nocasematch
+  case " $BINARY_BASENAMES " in *" $base "*) echo "binary"; return 0 ;; esac
+  case " $TEXT_BASENAMES " in *" $base "*) echo "text"; return 0 ;; esac
+}
+
+_classify_ext() {
+  local ext="$1"
+  [[ -z "$ext" ]] && return 0
+
+  shopt -s nocasematch
+  case " $BINARY_EXTS " in *" $ext "*) echo "binary"; return 0 ;; esac
+  case " $TEXT_EXTS " in *" $ext "*) echo "text"; return 0 ;; esac
+
+  # nocasematch off for cache lookup — cache keys are verbatim extensions.
+  shopt -u nocasematch
+  local cached
+  if cached=$(_mime_cache_lookup "$ext"); then
+    echo "$cached"
+    return 0
+  fi
+}
+
+# Extract extension from a path. Returns "" for extensionless files.
+_get_ext() {
+  local f="$1"
+  local ext="${f##*.}"
+  local base="${f##*/}"
+  if [[ "$ext" == "$f" || "$ext" == "$base" ]]; then
+    echo ""
+  else
+    echo "$ext"
+  fi
+}
+
+# Single-file text check. Use batch_classify_files for bulk operations.
+is_text_file() {
+  local f="$1"
+  local ext
+  ext=$(_get_ext "$f")
+  local class
+  class=$(_classify_ext "$ext")
+
+  [[ "$class" == "binary" ]] && return 1
+  [[ "$class" == "text" ]] && return 0
+
+  # Extensionless? Try known basename before expensive file(1).
+  if [[ -z "$ext" ]]; then
+    class=$(_classify_basename "${f##*/}")
+    [[ "$class" == "text" ]] && return 0
+  fi
+
+  # Tier 3 fallback: file(1)
+  local mime
+  mime=$(file -b --mime "$f" 2>/dev/null) || return 1
+
+  local result=1 kind=""
+  if [[ "$mime" == text/* ]] || [[ "$mime" =~ application/(json|xml|javascript|x-sh|x-yaml) ]]; then
+    result=0; kind="text"
+  elif [[ "$mime" =~ (utf-16|utf-32|binary) ]]; then
+    result=1; kind="binary"
+  elif [[ ! -s "$f" ]]; then
+    result=0; kind="text"
+  fi
+
+  # [Point 2] Use string cache instead of parallel arrays.
+  if [[ -n "$kind" && -n "$ext" ]]; then
+    _mime_cache_add "$ext" "$kind"
+  fi
+  return "$result"
+}
+
+# Batch classify: reads file paths from $1, writes text file paths to $2.
+# Known extensions are resolved inline (fast). Unknown extensions are batched
+# into a single file(1) call via xargs (one fork for all of them).
+batch_classify_files() {
+  local input_file="$1"
+  local output_file="$2"
+  local unknown_file
+  unknown_file=$(mktmp)
+
+  # Pass 1: awk classifies by extension + basename at C speed.
+  # Inputs come from git ls-files or find -type f, so files exist.
+  # Replaces the per-file bash loop that spawned 2-3 subshells per file.
+  awk -v bexts="$BINARY_EXTS" -v texts="$TEXT_EXTS" \
+      -v bbases="$BINARY_BASENAMES" -v tbases="$TEXT_BASENAMES" \
+      -v unknowns="$unknown_file" '
+  BEGIN {
+    n = split(bexts, a);  for (i=1;i<=n;i++) be[tolower(a[i])]=1
+    n = split(texts, a);  for (i=1;i<=n;i++) te[tolower(a[i])]=1
+    n = split(bbases, a); for (i=1;i<=n;i++) bb[tolower(a[i])]=1
+    n = split(tbases, a); for (i=1;i<=n;i++) tb[tolower(a[i])]=1
+  }
   {
-    for (i=1; i<NF; i++) {
+    path = $0
+    # extract basename
+    n = split(path, segs, "/")
+    base = segs[n]
+    # extract extension
+    # if base does not contain a dot, m=1
+    # if base is .eslint-ignore, m=2 and dots[1] is empty
+    m = split(base, dots, ".")
+    if (m > 1) {
+      if (m == 2 && dots[1] == "") ext = ""
+      else ext = tolower(dots[m])
+    } else {
+      ext = ""
+    }
+
+    # classify by extension
+    if (ext != "" && (ext in be)) next
+    if (ext != "" && (ext in te)) {
+      sub(/^\.\//, "", path); print path; next
+    }
+
+    # classify by basename
+    lbase = tolower(base)
+    if (lbase in bb) next
+    if (lbase in tb) { sub(/^\.\//, "", path); print path; next }
+
+    # unknown — queue for file(1)
+    print $0 > unknowns
+  }' < "$input_file" >> "$output_file"
+
+  # Pass 2: single file(1) invocation for all unknowns.
+  # Uses file(1) with filenames in output (-F separator) so each output
+  # line is self-describing. Avoids the fragile paste trick which can
+  # desync if filenames contain the delimiter character.
+  if [[ -s "$unknown_file" ]]; then
+    local mime_output sep_str
+    mime_output=$(mktmp)
+    sep_str='<:CATCLIP:>'
+
+    tr '\n' '\0' < "$unknown_file" \
+      | xargs -0 file -F "$sep_str" --mime 2>/dev/null \
+      > "$mime_output"
+
+    # [Point 14] Declare loop variables before the loop.
+    local batch_count=0 fpath mime_str is_text line
+    while IFS= read -r line; do
+      fpath="${line%%"$sep_str"*}"
+      mime_str="${line#*"$sep_str"}"
+      # file(1) pads output with spaces to align strings; strip ALL leading spaces
+      mime_str="${mime_str#"${mime_str%%[! ]*}"}"
+      ext=$(_get_ext "$fpath")
+      is_text=false
+
+      if [[ "$mime_str" == text/* ]] || [[ "$mime_str" =~ application/(json|xml|javascript|x-sh|x-yaml) ]]; then
+        is_text=true
+      elif [[ ! -s "$fpath" ]]; then
+        is_text=true
+      fi
+
+      # [Point 2] Use string cache.
+      if [[ -n "$ext" ]]; then
+        if [[ "$is_text" == true ]]; then
+          _mime_cache_add "$ext" "text"
+        elif [[ "$mime_str" =~ (utf-16|utf-32|binary) ]]; then
+          _mime_cache_add "$ext" "binary"
+        fi
+      fi
+
+      [[ "$is_text" == true ]] && echo "${fpath#./}" >> "$output_file"
+      batch_count=$((batch_count + 1))
+    done < "$mime_output"
+
+    vlog "Batch file(1): classified $batch_count unknown-extension files"
+    if [[ "$VERBOSE" == true ]]; then
+      local _uf
+      while IFS= read -r _uf; do
+        printf "[verbose]   %s\n" "${_uf#./}" >&2
+      done < "$unknown_file"
+    fi
+  fi
+}
+
+# ==============================================================================
+# CONFIG LOADING
+# ==============================================================================
+
+ignore_dirs=()
+ignore_files=()
+
+parse_hiss() {
+  local source="$1" line
+  [[ -r "$source" ]] || return 0
+
+  while IFS= read -r line; do
+    # Strip comments and whitespace
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+
+    # Directory (trailing /)
+    if [[ "$line" == */ ]]; then
+      ignore_dirs+=( "${line%/}" )
+    else
+      ignore_files+=( "$line" )
+    fi
+  done < "$source"
+}
+
+load_ignores() {
+  ignore_dirs=()
+  ignore_files=()
+  parse_hiss "$GLOBAL_HISS"
+}
+
+ensure_config() {
+  [[ -f "$GLOBAL_HISS" ]] && return 0
+  mkdir -p "$CONFIG_DIR"
+  get_default_hiss > "$GLOBAL_HISS"
+}
+
+# ==============================================================================
+# IGNORE SYSTEM
+#
+# Global .hiss + .gitignore.
+# Batch git check-ignore via --stdin (one fork, not N).
+# is_ignored() loops over ignore_files/ignore_dirs arrays directly.
+# ==============================================================================
+
+# is_ignored() checks file/dir arrays directly. bash case-statement
+# alternation (|) does not work from variable expansion, so we loop.
+# The arrays are small (tens of entries), so this is fast enough.
+
+build_ignore_patterns() {
+  : # Arrays are used directly by is_ignored(); nothing to prebuild.
+}
+
+is_ignored() {
+  local filepath="$1"
+  local filename="${filepath##*/}"
+  local p d
+
+  for p in ${ignore_files[@]+"${ignore_files[@]}"}; do
+    case "$filename" in $p) return 0 ;; esac
+    case "$filepath" in $p) return 0 ;; esac
+  done
+  for d in ${ignore_dirs[@]+"${ignore_dirs[@]}"}; do
+    case "$filepath" in "$d"/*|*"/$d"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+# Check if a directory name is in the ignore_dirs blocklist.
+is_dir_blocked() {
+  local dirname="$1"
+  dirname="${dirname%/}"
+  dirname="${dirname##*/}"
+  local d
+  for d in ${ignore_dirs[@]+"${ignore_dirs[@]}"}; do
+    [[ "$d" == "$dirname" ]] && return 0
+  done
+  return 1
+}
+
+# Find which .hiss rule matched a path, for error messages.
+# Returns the rule string, or "" if no match.
+find_matching_rule() {
+  local filepath="$1"
+  local filename="${filepath##*/}"
+  local p d
+  for p in ${ignore_files[@]+"${ignore_files[@]}"}; do
+    case "$filename" in $p) echo "$p"; return 0 ;; esac
+    case "$filepath" in $p) echo "$p"; return 0 ;; esac
+  done
+  for d in ${ignore_dirs[@]+"${ignore_dirs[@]}"}; do
+    case "$filepath" in "$d"/*|*"/$d"/*) echo "$d/"; return 0 ;; esac
+  done
+  return 1
+}
+
+# Apply --include patterns: remove matching entries from in-memory blocklist.
+# Called per-scope before discovery. Modifies ignore_dirs/ignore_files globals.
+apply_force_include() {
+  local force_csv="$1"
+  local patterns=()
+  IFS=',' read -ra patterns <<< "$force_csv"
+
+  local pat new_files=() new_dirs=() p d keep
+  for pat in "${patterns[@]}"; do
+    if [[ "$pat" == */ ]]; then
+      # Directory rule: remove from ignore_dirs
+      local dirname="${pat%/}"
+      new_dirs=()
+      for d in ${ignore_dirs[@]+"${ignore_dirs[@]}"}; do
+        [[ "$d" == "$dirname" ]] || new_dirs+=( "$d" )
+      done
+      ignore_dirs=( ${new_dirs[@]+"${new_dirs[@]}"} )
+    else
+      # File pattern: remove exact match from ignore_files
+      new_files=()
+      for p in ${ignore_files[@]+"${ignore_files[@]}"}; do
+        [[ "$p" == "$pat" ]] || new_files+=( "$p" )
+      done
+      ignore_files=( ${new_files[@]+"${new_files[@]}"} )
+    fi
+  done
+}
+
+# Apply --exclude patterns: add new entries to in-memory blocklist.
+# Called per-scope before discovery. Modifies ignore_dirs/ignore_files globals.
+apply_skip_patterns() {
+  local skip_csv="$1"
+  local patterns=()
+  IFS=',' read -ra patterns <<< "$skip_csv"
+
+  local pat
+  for pat in "${patterns[@]}"; do
+    if [[ "$pat" == */ ]]; then
+      ignore_dirs+=( "${pat%/}" )
+    else
+      ignore_files+=( "$pat" )
+    fi
+  done
+}
+
+# [Point 3] Reads paths from stdin, writes NON-ignored paths to stdout.
+# Uses process substitution to avoid extra temp files for sorting.
+batch_git_filter() {
+  local tmp_all tmp_ignored
+  tmp_all=$(mktmp)
+  tmp_ignored=$(mktmp)
+
+  cat > "$tmp_all"
+  [[ -s "$tmp_all" ]] || return 0
+
+  git check-ignore --stdin < "$tmp_all" > "$tmp_ignored" 2>/dev/null || true
+
+  if [[ ! -s "$tmp_ignored" ]]; then
+    cat "$tmp_all"
+  else
+    comm -23 <(sort "$tmp_all") <(sort "$tmp_ignored")
+  fi
+}
+
+# ==============================================================================
+# PATH RESOLUTION
+# ==============================================================================
+
+contains_parent_traversal() {
+  # Match ".." as a path component: standalone, leading, trailing, or mid-path.
+  # Must not false-positive on legitimate names like "foo.." or "..bar".
+  [[ "$1" == .. || "$1" == ../* || "$1" == */../* || "$1" == */.. ]]
+}
+
+fuzzy_search_dir() {
+  local name="$1"
+  local base="${2:-.}"
+  local no_ignore="${3:-false}"
+  local found=()
+
+  local prune_opts=()
+  if [[ "$no_ignore" == false ]] && (( ${#ignore_dirs[@]} > 0 )); then
+    local d
+    for d in "${ignore_dirs[@]}"; do
+      prune_opts+=( -name "$d" -prune -o )
+    done
+  fi
+
+  local all_matches=()
+  while IFS= read -r -d '' d; do
+    all_matches+=( "$d" )
+  done < <(find "$base" ${prune_opts[@]+"${prune_opts[@]}"} -type d -not -type l -name "*${name}*" -print0 2>/dev/null)
+
+  if (( ${#all_matches[@]} == 0 )); then
+    return 1
+  fi
+
+  # Batch git check-ignore instead of one fork per directory.
+  if [[ "$IS_GIT" == true && "$no_ignore" == false ]]; then
+    local ignored_list d
+    ignored_list=$(printf "%s\n" "${all_matches[@]}" \
+      | git check-ignore --stdin 2>/dev/null) || true
+    for d in "${all_matches[@]}"; do
+      case "$ignored_list" in
+        *"$d"*) ;; # ignored by git
+        *) found+=( "$d" ) ;;
+      esac
+    done
+  else
+    found=( "${all_matches[@]}" )
+  fi
+
+  if (( ${#found[@]} == 0 )); then
+    return 1
+  fi
+
+  if (( ${#found[@]} == 1 )); then
+    echo "${found[0]}"
+    return 0
+  fi
+
+  printf "%s\n" "${BOLD}Multiple matches for '$name':${RESET}" >&2
+  local i
+  for i in "${!found[@]}"; do
+    printf "  ${BOLD}%2d)${RESET} ${C_DIR}%s${RESET}\n" $((i+1)) "${found[i]}" >&2
+  done
+  if (( ${#found[@]} > 5 )); then
+    printf "\n%s\n" "${C_WARN}Tip:${RESET} ${DIM}Too many matches. Narrow with path segments:${RESET}" >&2
+    printf "  ${C_OK}catclip parent/${name}${RESET}\n" >&2
+  fi
+  local c
+  read -rp "Choose [1-${#found[@]}]: " c
+  if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#found[@]} )); then
+    echo "${found[c-1]}"
+    return 0
+  fi
+  printf "%s\n" "${C_ERR}Invalid selection.${RESET}" >&2
+  return 2  # 2 = had matches, selection failed (caller should not print hints)
+}
+
+resolve_chained_path() {
+  local path="$1"
+  local no_ignore="${2:-false}"
+  local current="."
+  local segments=()
+
+  IFS='/' read -ra segments <<< "$path"
+  local seg
+  for seg in "${segments[@]}"; do
+    if [[ -d "$current/$seg" ]]; then
+      current="$current/$seg"
+    elif resolved=$(fuzzy_search_dir "$seg" "$current" "$no_ignore"); then
+      current="$resolved"
+    else
+      printf "%s\n" "${C_ERR}Error: No directory matching '$seg' found in $current${RESET}" >&2
+      printf "  Check the spelling, or use --hiss to see if it's excluded.\n" >&2
+      return 1
+    fi
+  done
+  echo "$current"
+}
+
+# ==============================================================================
+# FILE DISCOVERY
+#
+# Central engine: given a directory, produce a list of text file paths.
+# Uses batch_classify_files for efficient binary detection (one file(1) fork).
+# Git-aware: uses 'git ls-files' when in a repo (handles .gitignore for free).
+# ==============================================================================
+
+# [Point 7] Consistent boolean convention: always compare with == true.
+discover_files() {
+  local dir="$1"
+  local no_ignore="$2"
+  local out_file="$3"
+  local only_csv="${4:-}"
+  local clean="${dir#./}"
+
+  if [[ "$IS_GIT" == true && "$no_ignore" != true ]]; then
+    # Use git ls-files (fast index read for tracked files) but pre-filter
+    # by ignore_dirs via awk before the expensive batch_classify_files.
+    # ignore_dirs is the big win — drops node_modules/ etc. (100k+ files).
+    # ignore_files are handled later in single_pass_filter on the small list.
+    local filtered
+    filtered=$(mktmp)
+
+    if (( ${#ignore_dirs[@]} > 0 )); then
+      local dirs_joined=""
+      local sep="" d
+      for d in "${ignore_dirs[@]}"; do
+        dirs_joined="${dirs_joined}${sep}${d}"
+        sep="|"
+      done
+      git ls-files --cached --others --exclude-standard -- "$clean" 2>/dev/null \
+        | awk -v dirs="$dirs_joined" '
+          BEGIN { n = split(dirs, d, "|") }
+          {
+            dominated = 0
+            for (i = 1; i <= n; i++) {
+              # matches d[i]/ at start or /d[i]/ anywhere
+              if (index($0, d[i] "/") == 1 || index($0, "/" d[i] "/") > 0) {
+                dominated = 1; break
+              }
+            }
+            if (!dominated) print
+          }' > "$filtered"
+    else
+      git ls-files --cached --others --exclude-standard -- "$clean" 2>/dev/null > "$filtered"
+    fi
+
+    batch_classify_files "$filtered" "$out_file"
+  else
+    local prune_opts=()
+    if [[ "$no_ignore" != true ]] && (( ${#ignore_dirs[@]} > 0 )); then
+      local d
+      for d in "${ignore_dirs[@]}"; do
+        prune_opts+=( -name "$d" -prune -o )
+      done
+    fi
+
+    # Optimization: when no_ignore=true and only_csv has simple *.ext globs,
+    # push them into find -name to avoid discovering everything then filtering.
+    local name_opts=()
+    if [[ "$no_ignore" == true && -n "$only_csv" ]]; then
+      local all_simple=true pat
+      local only_pats_arr=()
+      IFS=',' read -ra only_pats_arr <<< "$only_csv"
+      for pat in "${only_pats_arr[@]}"; do
+        if [[ "$pat" == \*.* && "$pat" != */* && "$pat" != *\** && "${pat:1}" == ".${pat#*.}" ]]; then
+          : # simple *.ext pattern
+        elif [[ "$pat" == \*.* && "$pat" != */* ]]; then
+          : # *.ext pattern (may have multiple dots)
+        else
+          all_simple=false; break
+        fi
+      done
+      if [[ "$all_simple" == true ]]; then
+        local first=true
+        name_opts+=( '(' )
+        for pat in "${only_pats_arr[@]}"; do
+          [[ "$first" == true ]] && first=false || name_opts+=( -o )
+          name_opts+=( -name "$pat" )
+        done
+        name_opts+=( ')' )
+      fi
+    fi
+
+    local raw_list
+    raw_list=$(mktmp)
+    if (( ${#name_opts[@]} > 0 )); then
+      find "$dir" ${prune_opts[@]+"${prune_opts[@]}"} -type f -not -type l "${name_opts[@]}" -print 2>/dev/null > "$raw_list"
+    else
+      find "$dir" ${prune_opts[@]+"${prune_opts[@]}"} -type f -not -type l -print 2>/dev/null > "$raw_list"
+    fi
+
+    if [[ "$no_ignore" != true ]]; then
+      local filtered
+      filtered=$(mktmp)
+      local f
+      while IFS= read -r f; do
+        [[ -r "$f" ]] || continue
+        is_ignored "${f#./}" || echo "$f"
+      done < "$raw_list" > "$filtered"
+      batch_classify_files "$filtered" "$out_file"
+    else
+      batch_classify_files "$raw_list" "$out_file"
+    fi
+  fi
+}
+
+# ==============================================================================
+# PATTERN MATCHING
+# ==============================================================================
+
+matches_pattern() {
+  local filepath="$1" pattern="$2"
+  local filename="${filepath##*/}"
+  case "$filename" in $pattern) return 0 ;; esac
+  case "$filepath" in $pattern) return 0 ;; esac
+  return 1
+}
+
+path_has_dir() {
+  local filepath="$1" dirname="$2"
+  [[ -n "$dirname" ]] || return 1
+  case "$filepath" in "$dirname"/*|*"/$dirname"/*) return 0 ;; esac
+  return 1
+}
+
+# ==============================================================================
+# TREE PRINTER
+# ==============================================================================
+
+# [Point 13] Use "k in last" instead of hardcoded depth limit.
+# Enhanced tree for --preview and regular mode: shows file sizes (heatmap) and git status.
+# Reads from:
+#   $1 = list_file (sorted paths)
+#   $2 = sizes_file (path\tsize_in_bytes, one per line)
+#   $3 = git_status_file (path\tstatus_letter, one per line; may be empty)
+print_tree() {
+  local list_file="$1" sizes_file="$2" git_status_file="${3:-}"
+  sort "$list_file" | awk \
+    -v dcol="$C_DIR" -v rst="$RESET" -v tcol="$C_TREE" \
+    -v dim="$DIM" -v cwarn="$C_WARN" -v cerr="$C_ERR" \
+    -v cok="$C_OK" -v cgit="$C_GIT" \
+    -v sizes_f="$sizes_file" -v git_f="$git_status_file" \
+    -F/ '
+  BEGIN {
+    # Load per-file sizes into sizes[] array.
+    while ((getline line < sizes_f) > 0) {
+      split(line, a, "\t")
+      sizes[a[1]] = a[2] + 0
+    }
+    close(sizes_f)
+    # Load git status into gstat[] array.
+    if (git_f != "") {
+      while ((getline line < git_f) > 0) {
+        split(line, a, "\t")
+        gstat[a[1]] = a[2]
+      }
+      close(git_f)
+    }
+  }
+  {
+    path = $0
+    # Print directory prefixes (unchanged from print_tree).
+    for (i = 1; i < NF; i++) {
       if ($i != last[i]) {
-        for (j=1; j<i; j++) printf tree_col "│   " reset
-        if (i == 1) printf "" 
-        else printf tree_col "├── " reset
-        print dir_col $i "/" reset
+        for (j = 1; j < i; j++) printf tcol "│   " rst
+        printf (i == 1 ? "" : tcol "├── " rst)
+        print dcol $i "/" rst
         last[i] = $i
-        for (k=i+1; k<=20; k++) delete last[k]
+        for (k = i+1; k in last; k++) delete last[k]
       }
     }
-    for (j=1; j<NF; j++) printf tree_col "│   " reset
-    printf tree_col "├── " reset
-    print $NF
+    # Print tree connector + filename.
+    for (j = 1; j < NF; j++) printf tcol "│   " rst
+    printf tcol "├── " rst
+    printf "%s", $NF
+
+    # Append size with heatmap color.
+    if (path in sizes) {
+      b = sizes[path]
+      # Format size: B, KB, or MB.
+      if (b < 1024) {
+        sz = sprintf("%dB", b)
+      } else if (b < 1048576) {
+        sz = sprintf("%.1fKB", b / 1024)
+      } else {
+        sz = sprintf("%.1fMB", b / 1048576)
+      }
+      # Heatmap: <40KB grey, <200KB yellow, else red.
+      if (b < 40000) {
+        printf " " dim "(%s)" rst, sz
+      } else if (b < 200000) {
+        printf " " cwarn "(%s)" rst, sz
+      } else {
+        printf " " cerr "(%s)" rst, sz
+      }
+    }
+
+    # Append git status marker.
+    if (path in gstat) {
+      s = gstat[path]
+      if (s == "M") {
+        printf " " cwarn "[M]" rst
+      } else if (s == "S") {
+        printf " " cok "[S]" rst
+      } else if (s == "?") {
+        printf " " cgit "[?]" rst
+      } else if (s == "A") {
+        printf " " cok "[A]" rst
+      }
+    }
+
+    printf "\n"
     delete last[NF]
   }'
 }
 
+# ==============================================================================
+# HELP
+#
+# Progressive disclosure:
+#   --help     → essentials (fits in one terminal screen)
+#   --help-all → full manual (scopes, evaluation order, patterns)
+# ==============================================================================
+
+# [Point 15] Document that --only and --ignore use shell glob patterns.
 print_help() {
   cat <<EOF
-${BOLD}catclip${RESET} ${DIM}v${VERSION}${RESET} - Copy code context for AI prompts
+${BOLD}catclip${RESET} ${DIM}v${VERSION}${RESET} — Copy code context for AI prompts
 
-  Recursively copies code files to your clipboard with a visual tree preview.
-  Automatically filters out secrets, binaries, and build artifacts.
-  Respects ${BOLD}.gitignore${RESET} and your ${BOLD}ignore list${RESET}.
+${BOLD}Usage:${RESET}  catclip [options] [target ...]
 
-${BOLD}Output Format:${RESET}
-  Each file is prefixed with ${DIM}# File: path/to/file${RESET} so AI can see the structure.
-
-${BOLD}Usage:${RESET}
-  catclip [OPTIONS] [TARGETS...]
-
-${BOLD}Targets:${RESET}
-  ${BOLD}Fuzzy Directory Search:${RESET}
-    ${CLR_SUCCESS}catclip auth${RESET}                   # Finds pages/auth and features/authentication (any directory matching 'auth')
-    ${CLR_SUCCESS}catclip components${RESET}              # Finds src/components, authentication/components, etc. (prompts if multiple)
-  
-  ${BOLD}Chained Path Resolution:${RESET}
-    ${CLR_SUCCESS}catclip shared/components/Badge.tsx${RESET}  # Resolves 'shared' → 'components' → copies 'Badge.tsx'
-    ${CLR_SUCCESS}catclip auth/api${RESET}                      # Resolves 'auth' → 'api' → copies directory contents
-
-  ${BOLD}Full Relative Paths:${RESET}
-    ${CLR_SUCCESS}catclip src/components/ui/Button.tsx${RESET}    # Fast. Use Tab completion from root (src/[TAB]/[TAB]...)
-    ${CLR_SUCCESS}catclip src/config/constants.ts${RESET}         # Precise. Avoids ambiguity for common filenames
-  
-  ${BOLD}Files in Current Directory:${RESET}
-    ${CLR_SUCCESS}catclip Dockerfile${RESET}              # File in current working directory
-    ${CLR_SUCCESS}catclip vite.config.js tsconfig.json${RESET}  # Multiple files
-  
-  ${BOLD}Mixed Arguments:${RESET}
-    ${CLR_SUCCESS}catclip README.md src/features/todos${RESET}
-    # → Copies 'README.md' + entire 'todos' feature directory
-
-  ${BOLD}Paths with Spaces:${RESET}
-    ${CLR_SUCCESS}catclip "docs/User Guide.md"${RESET}  # Use quotes for paths with spaces
+${BOLD}Examples:${RESET}
+  ${C_OK}catclip${RESET}                          Copy all files in current directory
+  ${C_OK}catclip src lib${RESET}                   Copy specific directories
+  ${C_OK}catclip src --only "*.ts"${RESET}         Only TypeScript files in src/
+  ${C_OK}catclip src --exclude "*.test.*"${RESET}              Skip test files
+  ${C_OK}catclip src --include "tests/,*.test.ts"${RESET}    Remove rules, include tests
+  ${C_OK}catclip . --include "*"${RESET}                     Disable all ignore rules
+  ${C_OK}catclip src --changed${RESET}             Only git-modified files in src/
+  ${C_OK}catclip src --contains TODO${RESET}           Only files whose contents match regex
 
 ${BOLD}Options:${RESET}
-  ${CLR_SUCCESS}--help, -h${RESET}
-      Show this help message.
+  ${C_OK}-h, --help${RESET}           Show this help
+  ${C_OK}--help-all${RESET}           Show full manual (scopes, patterns, all options)
+  ${C_OK}--version${RESET}            Show version
+  ${C_OK}-v, --verbose${RESET}        Show phase timings and debug info
+  ${C_OK}-q, --quiet${RESET}          Suppress all informational output (errors only)
+  ${C_OK}-p, --print${RESET}          Output to screen (stdout) instead of clipboard
+  ${C_OK}-y, --yes${RESET}            Skip confirmation for large copies
+  ${C_OK}-t, --no-tree${RESET}        Skip tree preview
+  ${C_OK}--hiss${RESET}               Open ignore config in editor
+  ${C_OK}--hiss-reset${RESET}         Restore ignore config to defaults
+  ${C_OK}--preview${RESET}            Show file tree and token count, skip copying
 
-  ${CLR_SUCCESS}--ignore, -i [OPERATIONS]${RESET}
-      Temporary ignores for this run only (does not modify your config).
-      If no targets are provided, defaults to current directory (.).
-      ${CYAN}Legend:${RESET} + = adds to ignore, - = removes from ignore, d = directory.
-      ${CYAN}Quote globs/spaces:${RESET} +'*.css' d+'my dir'
-      
-      ${CLR_SUCCESS}catclip src --ignore +'*.css' d-tests -'*.log'${RESET}
-      ${DIM}# → Ignore CSS, include tests dir, include logs (just this run)${RESET}
+${BOLD}Scope Modifiers:${RESET} (apply to the current scope)
+  ${C_OK}--include RULES${RESET}      Remove rules from blocklist this run (comma-separated; "*" = all)
+  ${C_OK}--exclude GLOBS${RESET}      Add skip rules this run (comma-separated; trailing / = directory)
+  ${C_OK}--only GLOB${RESET}          Include only files matching shell glob (OR across repeats)
+  ${C_OK}--changed${RESET}            Only git-modified files
+  ${C_OK}--contains PATTERN${RESET}   Only files whose contents match regex pattern
+  ${C_OK}--then${RESET}               Start a new scope (separate targets with different modifiers)
 
-  ${CLR_SUCCESS}--ignore-always [OPERATIONS]${RESET}
-      Persistently modify your ignore list (saves to ~/.config/catclip/ignore.yaml).
-      Same syntax as --ignore.
-      
-      ${CLR_SUCCESS}catclip --ignore-always d+node_modules +'*.map' -package-lock.json${RESET}
-      ${DIM}# → Add node_modules/ and *.map to ignore list, remove lockfile from ignore list${RESET}
-
-  ${CLR_SUCCESS}--no-ignore, -n${RESET}
-      Temporarily bypass all ignore rules for this copy only.
-      
-      ${CLR_SUCCESS}catclip --no-ignore dist${RESET}
-      ${CLR_SUCCESS}catclip --no-ignore .env.local${RESET}
-
-  ${CLR_SUCCESS}--list-ignores, -l${RESET}
-      Show what files and directories are currently being ignored.
-
-  ${CLR_SUCCESS}--print, -p${RESET}
-      Print to terminal in addition to copying to clipboard.
-
-  ${CLR_SUCCESS}--changed${RESET}
-      Copy only files changed since the last commit (git repo required).
-      Optional targets limit the scope (example: catclip src --changed).
-
-  ${CLR_SUCCESS}--no-tree, -t${RESET}
-      Skip tree rendering for faster output on large file sets.
-
-  ${CLR_SUCCESS}--yes, -y${RESET}
-      Skip confirmation prompt (useful for large copies or scripts).
-
-  ${CLR_SUCCESS}--version, -v${RESET}
-      Show the installed version.
-
-  ${CLR_SUCCESS}--reset-config, -r${RESET}
-      Restore the configuration file to factory defaults.
-
-${CLR_ERROR}Not Allowed:${RESET}
-  catclip ../config                              # Cannot go above working directory
-  catclip /absolute/path/to/file                 # Absolute paths are not allowed
-
-${BOLD}Config Location:${RESET}
-  ${DIM}$CONFIG${RESET}
+${DIM}Patterns use shell glob syntax (*, ?, [...]), not regex.${RESET}
+${DIM}Exception: --contains uses regex (grep -E extended regex).${RESET}
+${DIM}Run 'catclip --help-all' for the full manual.${RESET}
 EOF
 }
 
-# ------------------------------------------------------------------------------
-# OPTIMIZED BINARY DETECTION
-# ------------------------------------------------------------------------------
-# Strategy: Check extensions first (fast), only use 'file --mime' as fallback.
-# This avoids spawning a subprocess for every file. 10x faster on large repos.
+print_help_all() {
+  print_help
+  cat <<EOF
 
-# Cache mime results by extension to avoid repeated 'file' calls.
-mime_cache_exts=()
-mime_cache_vals=()
+${BOLD}━━━ Full Manual ━━━${RESET}
 
-is_text_file() {
-  local f="$1"
-  local ext="${f##*.}"
-  
-  # ----------------------------------------------------------------------------
-  # TIER 1: HARD BLOCKS (Return 1)
-  # ----------------------------------------------------------------------------
-  # Files that are technically unreadable (binary), dangerous to print (weights),
-  # or effectively useless "token poison" (SVGs, Source Maps).
-  #
-  # Categories:
-  #   1. Images (Raster & Vector) - SVG is here because path data is token poison
-  #   2. Documents (Office & PDF are Zipped XMLs/Binaries)
-  #   3. Archives & Disk Images
-  #   4. Compiled Executables, Libraries & Debug Symbols
-  #   5. Bytecode & Virtual Machine Artifacts
-  #   6. Mobile & Package Installers
-  #   7. AI Models & Large Data (CRITICAL protection against massive files)
-  #   8. Audio & Video
-  #   9. Fonts
-  #   10. 3D & Design (Binary formats)
-  #   11. Database, Generic Binary, & Developer Noise (map=Sourcemaps, lockb=Bun)
-  case "$ext" in
-    png|jpg|jpeg|gif|bmp|ico|svg|webp|tif|tiff|psd|xcf|heic|raw|\
-pdf|docx|doc|xlsx|xls|pptx|ppt|odt|ods|odp|rtf|\
-zip|tar|gz|bz2|xz|7z|rar|dmg|iso|img|vmdk|qcow2|\
-exe|dll|so|dylib|a|lib|o|obj|pdb|\
-class|jar|war|ear|pyc|pyo|pyd|wasm|beam|rlib|\
-apk|aab|ipa|msi|cab|deb|rpm|\
-pt|pth|ckpt|safetensors|onnx|gguf|h5|pkl|parquet|arrow|\
-mp3|mp4|mov|avi|mkv|webm|flv|wmv|m4a|wav|flac|ogg|3gp|\
-ttf|otf|woff|woff2|eot|\
-blend|glb|fbx|3ds|\
-db|sqlite|sqlite3|bin|dat|hex|dump|map|lockb)
-      return 1
-      ;;
+${BOLD}Scope System:${RESET}
+  Use ${C_OK}--then${RESET} to separate scopes with different modifiers.
+  Layout: ${DIM}TARGETS [MODIFIERS...] --then TARGETS [MODIFIERS...] ...${RESET}
+
+  ${C_OK}catclip src --only "*.ts" --exclude "*.test.ts" --then features --only "*.tsx"${RESET}
+  ${DIM}  Scope 1: src/ — TypeScript files, skipping tests${RESET}
+  ${DIM}  Scope 2: features/ — TSX files only${RESET}
+
+  Without ${C_OK}--then${RESET}, all targets share the same modifiers:
+  ${C_OK}catclip src lib${RESET}               ${DIM}Both use default rules${RESET}
+  ${C_OK}catclip src lib --only "*.ts"${RESET}  ${DIM}Both filtered to .ts files${RESET}
+
+${BOLD}Target Resolution:${RESET}
+  ${C_OK}catclip auth${RESET}                      Fuzzy directory search
+  ${C_OK}catclip shared/components/Badge.tsx${RESET} Chained path resolution
+  ${C_OK}catclip src/Button.tsx${RESET}             Direct file path
+
+${BOLD}--include (remove rules):${RESET}
+  Removes rules from the .hiss blocklist for this run only.
+  Comma-separated patterns. Trailing / = directory rule.
+  ${C_OK}--include "tests/"${RESET}              Include tests/ directory
+  ${C_OK}--include "tests/,*.test.ts"${RESET}    Include tests/ AND test files
+  ${C_OK}--include "*"${RESET}                   Remove ALL rules (full scan, slower)
+  ${C_OK}catclip . --include "*" --only "*.log"${RESET}  All rules off, only .log files
+
+${BOLD}--exclude (add rules):${RESET}
+  Adds temporary skip rules for this run only.
+  Comma-separated patterns. Trailing / = directory.
+  ${C_OK}--exclude "*.test.*"${RESET}            Skip test files
+  ${C_OK}--exclude "*.test.*,*.snap"${RESET}     Skip tests and snapshots
+  ${C_OK}--exclude "build/"${RESET}              Skip build directory
+
+${BOLD}Editing Ignore Rules:${RESET}
+  ${C_OK}catclip --hiss${RESET}          Open ignore config in editor
+  ${C_OK}catclip --hiss-reset${RESET}    Restore defaults
+
+${BOLD}Ignore System:${RESET}
+  Global config: ${C_OK}~/.config/catclip/.hiss${RESET} (gitignore-compatible syntax)
+  Git projects also respect ${C_OK}.gitignore${RESET} via ${DIM}git check-ignore${RESET}.
+
+${BOLD}Example .hiss:${RESET}
+  ${DIM}# Ignore build output${RESET}
+  ${DIM}dist/${RESET}
+  ${DIM}*.min.js${RESET}
+  ${DIM}# Ignore specific file${RESET}
+  ${DIM}test/fixtures.json${RESET}
+
+${BOLD}--contains (content search):${RESET}
+  Filters to files whose contents match a regex pattern (grep -E).
+  ${C_OK}--contains TODO${RESET}                   Files containing "TODO"
+  ${C_OK}--contains "useState|useEffect"${RESET}   Files matching either hook
+  ${C_OK}--contains '\\\$store'${RESET}               Escaped special characters
+  ${DIM}Plain text works for most searches. Use single quotes for special chars.${RESET}
+
+  ${BOLD}Pattern types:${RESET}
+    ${DIM}--only, --exclude, --include${RESET}  → shell globs (*, ?, [...]) match filenames
+    ${DIM}--contains${RESET}                    → regex (grep -E) matches file contents
+
+${BOLD}Evaluation Order (per scope):${RESET}
+  ${DIM}1.${RESET} Load .hiss into memory
+  ${DIM}2.${RESET} Apply --include (remove rules from blocklist)
+  ${DIM}3.${RESET} Apply --exclude (add rules to blocklist)
+  ${DIM}4.${RESET} Discover files (find/git ls-files with modified blocklist)
+  ${DIM}5.${RESET} Apply --only filter
+  ${DIM}6.${RESET} Apply --contains filter (grep content match)
+  ${DIM}7.${RESET} Binary exclusion (always, cannot be overridden)
+
+${BOLD}Pattern Matching (shell globs, not regex):${RESET}
+  Globs match against both basename and full path:
+    ${DIM}*.ts${RESET}  ${DIM}test/*.ts${RESET}  ${DIM}**/test/*.ts${RESET}
+  Supported wildcards: ${DIM}*${RESET} (any chars), ${DIM}?${RESET} (single char), ${DIM}[...]${RESET} (char class)
+
+${BOLD}Output Format:${RESET}
+  Each file is wrapped in ${DIM}<file path="path/to/file">${RESET}
+
+${C_ERR}Not Allowed:${RESET}
+  ${DIM}catclip ../parent${RESET}    Cannot go above working directory
+  ${DIM}catclip /abs/path${RESET}    Absolute paths not allowed
+
+${BOLD}Config:${RESET} ${DIM}$(short_path "$GLOBAL_HISS")${RESET}  ${DIM}(catclip --hiss to edit)${RESET}
+EOF
+}
+
+# ==============================================================================
+# CLIPBOARD
+#
+# Stored as an array — no eval. Array dispatch is injection-proof.
+# ==============================================================================
+
+CLIPBOARD_CMD=()
+
+detect_clipboard_cmd() {
+  case "$PLATFORM" in
+    macos)
+      command -v pbcopy &>/dev/null && { CLIPBOARD_CMD=(pbcopy); return 0; } ;;
+    wsl)
+      command -v clip.exe &>/dev/null && { CLIPBOARD_CMD=(clip.exe); return 0; } ;;
   esac
-  
-  # ----------------------------------------------------------------------------
-  # TIER 2: TEXT ALLOW LIST (Return 0)
-  # ----------------------------------------------------------------------------
-  # Files strictly defined as text. We list them here to bypass the slow
-  # 'file --mime' check. This includes "Soft Blocks" like .lock or .xml
-  # which are text but usually ignored via YAML config.
-  #
-  # Categories:
-  #   1. Web & Markup
-  #   2. Configuration & Data
-  #   3. Documentation
-  #   4. Scripting & Shell
-  #   5. Compiled Languages (Source)
-  #   6. Game Dev & Graphics Code
-  #   7. Build Systems & CI/CD
-  #   8. Project Files
-  #   9. Niche / Functional / Scientific
-  #   10. Data & Specialized Formats
-  #   11. Modern Frameworks & Templates
-  case "$ext" in
-    html|htm|css|scss|sass|less|js|jsx|mjs|cjs|ts|tsx|mts|cts|\
-json|yaml|yml|xml|toml|ini|cfg|conf|properties|env|lock|\
-md|markdown|txt|text|rst|adoc|\
-py|pyw|pyi|ipynb|rb|erb|haml|pl|pm|lua|sh|bash|zsh|fish|bat|cmd|ps1|psm1|psd1|\
-c|cc|cpp|cxx|h|hh|hpp|hxx|go|rs|swift|kt|kts|scala|cs|fs|vb|vbs|java|jsp|php|sql|\
-gd|godot|shader|unity|qml|\
-makefile|Makefile|mk|cmake|gradle|jenkinsfile|Jenkinsfile|\
-dockerfile|Dockerfile|groovy|gvy|tf|hcl|\
-sln|csproj|vbproj|fsproj|\
-r|R|rmd|clj|cljs|ex|exs|erl|hrl|elm|nim|zig|v|d|m|mm|\
-hs|lhs|jl|cl|lisp|rkt|asm|s|\
-csv|tsv|graphql|gql|proto|sol|patch|diff|\
-vim|dart|vue|svelte|astro|tex|j2|ejs|hbs|mustache|liquid|pug|jade)
-      return 0
-      ;;
-  esac
-  
-  # ----------------------------------------------------------------------------
-  # TIER 3: SLOW FALLBACK
-  # ----------------------------------------------------------------------------
-  if [[ -n "$ext" ]]; then
-    for i in "${!mime_cache_exts[@]}"; do
-      if [[ "${mime_cache_exts[i]}" == "$ext" ]]; then
-        [[ "${mime_cache_vals[i]}" == "text" ]] && return 0
-        [[ "${mime_cache_vals[i]}" == "binary" ]] && return 1
-      fi
-    done
-  fi
 
-  local mime
-  local result=1
-  local cache_kind=""
-  mime=$(file -b --mime "$f" 2>/dev/null)
-  
-  if [[ "$mime" =~ utf-16 ]] || [[ "$mime" =~ utf-32 ]] || [[ "$mime" =~ binary ]]; then
-    result=1
-    cache_kind="binary"
-  elif [[ "$mime" == text/* ]] || [[ "$mime" =~ application/json ]] || [[ "$mime" =~ application/xml ]] || \
-       [[ "$mime" =~ application/javascript ]] || [[ "$mime" =~ application/x-sh ]] || [[ "$mime" =~ application/x-yaml ]]; then
-    result=0
-    cache_kind="text"
-  elif [[ ! -s "$f" ]]; then
-    result=0
-    cache_kind="text"
-  fi
+  local is_wayland=false
+  [[ "${XDG_SESSION_TYPE:-}" == "wayland" || -n "${WAYLAND_DISPLAY:-}" ]] && is_wayland=true
 
-  if [[ -n "$cache_kind" && -n "$ext" ]]; then
-    mime_cache_exts+=( "$ext" )
-    mime_cache_vals+=( "$cache_kind" )
-  fi
-
-  return "$result"
-}
-
-# Prompt for y/n with a default without failing in non-interactive contexts.
-# Sets PROMPT_RESPONSE to "y" or "n" (lowercase).
-# ------------------------------------------------------------------------------
-# PATH RESOLUTION HELPERS
-# ------------------------------------------------------------------------------
-
-# SECURITY: Block parent traversal (../) to prevent copying outside project.
-contains_parent_traversal() {
-  local path="$1"
-  [[ "$path" == *../* || "$path" == ../* || "$path" == *.. ]]
-}
-
-is_absolute_path() {
-  local path="$1"
-  [[ "$path" == /* ]]
-}
-
-has_slashes() {
-  [[ "$1" == */* ]]
-}
-
-# Fuzzy search for directories matching *pattern* anywhere in the tree.
-# Optional base_dir scopes the search. Uses indexed arrays for Bash 3.2 compat.
-fuzzy_search_dir() {
-  local search_name="$1"
-  local base_dir="${2:-.}"  # Default to current directory if not specified
-  local found=()
-  
-  local search_prune_opts=()
-  if [[ "$NO_IGNORE" == false ]] && (( ${#ignore_dirs[@]} > 0 )); then
-    for d in "${ignore_dirs[@]}"; do 
-      search_prune_opts+=( -name "$d" -prune -o )
-    done
-  fi
-
-  local find_cmd_opts=()
-  if (( ${#search_prune_opts[@]} > 0 )); then
-    find_cmd_opts=( "${search_prune_opts[@]}" )
-  fi
-  find_cmd_opts+=( -type d -name "*${search_name}*" -print0 )
-
-  while IFS= read -r -d '' d; do 
-    if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]]; then
-      if git check-ignore -q "$d" 2>/dev/null; then 
-        continue
-      fi
-    fi
-    found+=( "$d" )
-  done < <(find "$base_dir" "${find_cmd_opts[@]}" 2>/dev/null)
-  
-  if (( ${#found[@]} == 0 )); then
-    return 1
-  elif (( ${#found[@]} == 1 )); then
-    echo "${found[0]}"
-    return 0
+  if [[ "$is_wayland" == true ]]; then
+    command -v wl-copy &>/dev/null && { CLIPBOARD_CMD=(wl-copy); return 0; }
+    command -v xclip &>/dev/null  && { CLIPBOARD_CMD=(xclip -selection clipboard); return 0; }
+    command -v xsel &>/dev/null   && { CLIPBOARD_CMD=(xsel --clipboard --input); return 0; }
   else
-    local context_msg="'$search_name'"
-    [[ "$base_dir" != "." ]] && context_msg="'$search_name' in ${CLR_DIR}$base_dir${RESET}"
-    printf "%s\n" "${BOLD}Multiple matches for $context_msg:${RESET}" >&2
-    for i in "${!found[@]}"; do 
-      printf "  ${BOLD}%2d)${RESET} ${CLR_DIR}%s${RESET}\n" $((i+1)) "${found[i]}" >&2
-    done
-    if (( ${#found[@]} > 5 )); then
-      printf "%s\n" "${CLR_WARN}Tip:${RESET} ${DIM}Too many matches. Narrow it with exact parents like 'parent/${search_name}' or 'parent_of_parent/parent/${search_name}'.${RESET}" >&2
+    command -v xclip &>/dev/null && { CLIPBOARD_CMD=(xclip -selection clipboard); return 0; }
+    command -v xsel &>/dev/null  && { CLIPBOARD_CMD=(xsel --clipboard --input); return 0; }
+  fi
+  return 1
+}
+
+print_clipboard_install_hint() {
+  case "$PLATFORM" in
+    macos) printf "  Ensure pbcopy is in PATH (ships with macOS).\n" >&2 ;;
+    wsl)   printf "  Ensure clip.exe is available (ships with WSL).\n" >&2 ;;
+    linux)
+      if [[ "${XDG_SESSION_TYPE:-}" == "wayland" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+        printf "  Wayland detected. Install wl-clipboard:\n" >&2
+        printf "    sudo apt install wl-clipboard    ${DIM}# Debian/Ubuntu${RESET}\n" >&2
+        printf "    sudo pacman -S wl-clipboard      ${DIM}# Arch${RESET}\n" >&2
+      else
+        printf "  X11 detected. Install xclip:\n" >&2
+        printf "    sudo apt install xclip           ${DIM}# Debian/Ubuntu${RESET}\n" >&2
+        printf "    sudo pacman -S xclip             ${DIM}# Arch${RESET}\n" >&2
+      fi ;;
+  esac
+}
+
+# ==============================================================================
+# SCOPE STORAGE & EVALUATION
+#
+# [Point 1] Parallel arrays indexed by scope number instead of string packing.
+# --include removes rules, --exclude adds rules. Both modify the in-memory blocklist before discovery.
+# ==============================================================================
+
+# Parallel arrays — one entry per scope.
+SCOPE_TARGETS=()
+SCOPE_CHANGED=()
+SCOPE_NO_IGNORE=()
+SCOPE_ONLY=()
+SCOPE_SKIP=()
+SCOPE_FORCE=()
+SCOPE_CONTAINS=()
+HAD_FUZZY_FAIL=false
+
+add_scope() {
+  SCOPE_TARGETS+=( "$1" )
+  SCOPE_CHANGED+=( "$2" )
+  SCOPE_NO_IGNORE+=( "$3" )
+  SCOPE_ONLY+=( "$4" )
+  SCOPE_SKIP+=( "$5" )
+  SCOPE_FORCE+=( "$6" )
+  SCOPE_CONTAINS+=( "$7" )
+}
+
+  # Prefer inlining ${#SCOPE_TARGETS[@]} at call sites to avoid
+  # subshell forks. This function exists only for the few places
+  # where a command substitution is unavoidable (e.g. local assignment).
+scope_count() {
+  echo "${#SCOPE_TARGETS[@]}"
+}
+
+# Single-pass filter: is_ignored + --only.
+# --include/--exclude patterns are already applied to the blocklist before discovery.
+# This filter handles file-level ignore_files (git path skips them during ls-files)
+# and the --only inclusion filter.
+single_pass_filter() {
+  local is_no_ignore="$1"
+  local only_csv="$2"
+
+  # Parse --only patterns once.
+  local only_pats=()
+  if [[ -n "$only_csv" ]]; then
+    IFS=',' read -ra only_pats <<< "$only_csv"
+  fi
+
+  local f p match
+  while IFS= read -r f; do
+    # ── Safety filter ──
+    if [[ "$is_no_ignore" != true ]]; then
+      is_ignored "$f" && continue
     fi
-    read -rp "Choose [1-${#found[@]}]: " c
-    if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#found[@]} )); then
-      echo "${found[c-1]}"
-      return 0
-    else
-      printf "%s\n" "${CLR_ERROR}Invalid selection.${RESET}" >&2
+
+    # ── --only filter (OR across patterns) ──
+    if (( ${#only_pats[@]} > 0 )); then
+      match=false
+      for p in "${only_pats[@]}"; do
+        matches_pattern "$f" "$p" && { match=true; break; }
+      done
+      [[ "$match" != true ]] && continue
+    fi
+
+    echo "$f"
+  done
+}
+
+evaluate_scope() {
+  local idx="$1"
+  local targets_csv="${SCOPE_TARGETS[$idx]}"
+  local is_changed="${SCOPE_CHANGED[$idx]}"
+  local is_no_ignore="${SCOPE_NO_IGNORE[$idx]}"
+  local only_csv="${SCOPE_ONLY[$idx]}"
+  local skip_csv="${SCOPE_SKIP[$idx]}"
+  local force_csv="${SCOPE_FORCE[$idx]}"
+  local contains_pattern="${SCOPE_CONTAINS[$idx]}"
+
+  local targets=()
+  if [[ -n "$targets_csv" ]]; then
+    IFS=',' read -ra targets <<< "$targets_csv"
+  else
+    targets=( "." )
+  fi
+
+  # ── Save original blocklist, modify for this scope ──
+  local saved_ignore_dirs=( ${ignore_dirs[@]+"${ignore_dirs[@]}"} )
+  local saved_ignore_files=( ${ignore_files[@]+"${ignore_files[@]}"} )
+
+  # Step 1: --include patterns remove rules from blocklist
+  if [[ "$is_no_ignore" == true ]]; then
+    ignore_dirs=(); ignore_files=()
+    printf "  ${C_WARN}⚠ --include \"*\" active: all rules disabled, full scan (slower)${RESET}\n" >&2
+  elif [[ -n "$force_csv" ]]; then
+    apply_force_include "$force_csv"
+  fi
+
+  # Step 2: --exclude patterns add rules to blocklist
+  if [[ -n "$skip_csv" ]]; then
+    apply_skip_patterns "$skip_csv"
+  fi
+
+  # Rebuild patterns with modified blocklist (--include/--exclude already applied)
+  build_ignore_patterns
+
+  # ── Resolve targets (paths are pure discovery starting points) ──
+  local discovered_file
+  discovered_file=$(mktmp)
+
+  local t
+  for t in "${targets[@]}"; do
+    if contains_parent_traversal "$t"; then
+      printf "%s\n" "${C_ERR}Error: Cannot traverse above working directory: '$t'${RESET}" >&2
+      printf "  catclip only operates within the current directory tree.\n" >&2
+      printf "  Use a relative path from your project root instead.\n" >&2
+      printf "  Example: ${C_OK}catclip config/${RESET}\n" >&2
       exit 2
     fi
-  fi
-}
+    if [[ "$t" == /* ]]; then
+      printf "%s\n" "${C_ERR}Error: Absolute paths not allowed: '$t'${RESET}" >&2
+      printf "  Use a relative path from your project root instead.\n" >&2
+      exit 2
+    fi
 
-# Resolve a chained path like "accessibility/browser/file.ts"
-# Returns the resolved directory path (without filename)
-# Usage: resolve_chained_path "dir1/dir2/dir3" -> resolved_path
-resolve_chained_path() {
-  local path_segments="$1"
-  local current_base="."
-  local segments=()
-  
-  # Split path by /
-  IFS='/' read -ra segments <<< "$path_segments"
-  
-  for segment in "${segments[@]}"; do
-    # First check if exact subdirectory exists
-    if [[ -d "$current_base/$segment" ]]; then
-      current_base="$current_base/$segment"
-    else
-      # Fuzzy search within current base (using unified function with base_dir)
-      if resolved=$(fuzzy_search_dir "$segment" "$current_base"); then
-        current_base="$resolved"
+    if [[ -f "$t" ]]; then
+      local clean="${t#./}"
+      # Paths are discovery targets — always filtered by rules
+      if [[ "$is_no_ignore" != true ]] && is_ignored "$clean"; then
+        local rule=""
+        rule=$(find_matching_rule "$clean") || true
+        printf "\n%s\n" "${C_ERR}Error: '${clean}' is ignored by rule '${rule}' in .hiss${RESET}" >&2
+        printf "\n  ${DIM}To include it this run:${RESET}   ${C_OK}catclip . --include \"%s\"${RESET}\n" "$rule" >&2
+        printf "  ${DIM}To include everything:${RESET}   ${C_OK}catclip . --include \"*\"${RESET}\n" >&2
+        printf "  ${DIM}To remove permanently:${RESET}   ${C_OK}catclip --hiss${RESET} ${DIM}(delete the rule)${RESET}\n" >&2
       else
-        local ret=$?
-        if (( ret == 2 )); then exit 2; fi
-        
-        printf "%s\n" "${CLR_ERROR}Error: No directory matching '$segment' found in $current_base${RESET}" >&2
-        return 1
+        [[ -r "$t" ]] && is_text_file "$t" && echo "$clean" >> "$discovered_file"
       fi
-    fi
-  done
-  
-  echo "$current_base"
-  return 0
-}
+    elif [[ -d "$t" ]]; then
+      # Check if directory is blocked (skip for ".")
+      if [[ "$t" != "." && "$is_no_ignore" != true ]] && is_dir_blocked "$t"; then
+        local dirname="${t%/}"; dirname="${dirname##*/}"
+        printf "\n%s\n" "${C_ERR}Error: '${t}' is ignored by .hiss${RESET}" >&2
+        printf "\n  ${DIM}To include it this run:${RESET}   ${C_OK}catclip . --include \"${dirname}/\"${RESET}\n" >&2
+        printf "  ${DIM}To include everything:${RESET}   ${C_OK}catclip . --include \"*\"${RESET}\n" >&2
+        printf "  ${DIM}To remove permanently:${RESET}   ${C_OK}catclip --hiss${RESET} ${DIM}(delete the rule)${RESET}\n" >&2
+      else
+        discover_files "$t" "$is_no_ignore" "$discovered_file" "$only_csv"
+      fi
+    elif [[ "$t" != */* ]]; then
+      # Fuzzy search for directory
+      local fuzzy_rc=0
+      resolved=$(fuzzy_search_dir "$t" "." "$is_no_ignore") || fuzzy_rc=$?
 
-check_file_ignore() {
-  local filename="$1"
-  
-  if [[ "$NO_IGNORE" == true ]]; then
-    return 1
-  fi
-  
-  for pat in "${ignore_files[@]:-}"; do
-    if [[ "$filename" == $pat ]]; then
-      return 0
-    fi
-  done
-  
-  return 1
-}
+      if (( fuzzy_rc == 0 )); then
+        discover_files "$resolved" "$is_no_ignore" "$discovered_file" "$only_csv"
+      elif (( fuzzy_rc == 2 )); then
+        HAD_FUZZY_FAIL=true  # Had matches but user didn't select
+      else
+        # No matches at all — smart error
+        local known_file=false
+        local base_class
+        base_class=$(_classify_basename "$t")
+        [[ "$base_class" == "text" ]] && known_file=true
 
-# ------------------------------------------------------------------------------
-# IGNORE CHECKING
-# ------------------------------------------------------------------------------
-# Two ignore sources: YAML config (global) + .gitignore (project-specific).
-# IGNORE_REASON tracks which source matched, for better error messages.
-
-# Returns 0 if ignored, 1 if allowed. Sets IGNORE_REASON to "yaml" or "gitignore".
-# Returns 0 if ignored by YAML config only.
-is_dir_ignored_yaml() {
-  local dirname="$1"
-  if [[ "$NO_IGNORE" == true ]]; then return 1; fi
-  if (( ${#ignore_dirs[@]} > 0 )); then
-    for d in "${ignore_dirs[@]}"; do
-      if [[ "$dirname" == "$d" ]]; then return 0; fi
-    done
-  fi
-  return 1
-}
-
-# Returns 0 if ignored, 1 if allowed. Sets IGNORE_REASON.
-is_dir_ignored() {
-  local dirpath="$1"
-  local dirname
-  dirname=$(basename "$dirpath")
-  IGNORE_REASON=""
-  
-  if [[ "$NO_IGNORE" == true ]]; then
-    return 1
-  fi
-  
-  # Check YAML config first
-  if is_dir_ignored_yaml "$dirname"; then
-    IGNORE_REASON="yaml"
-    return 0
-  fi
-  
-  # Check git ignore if in git repo
-  if [[ "$IS_GIT" == true ]]; then
-    if git check-ignore -q "$dirpath" 2>/dev/null; then
-      IGNORE_REASON="gitignore"
-      return 0
-    fi
-  fi
-  
-  return 1
-}
-
-# Print standardized "directory is ignored" error/warning message
-# Usage: print_dir_ignore_msg <dir_name> ["error"|"warning"]
-print_dir_ignore_msg() {
-  local dir_name="$1"
-  local msg_type="${2:-error}"
-  
-  local prefix action suffix
-  if [[ "$msg_type" == "warning" ]]; then
-    prefix="${CLR_WARN}Warning:"
-    action="but proceeding with explicit path."
-  else
-    prefix="${CLR_ERROR}Error:"
-    action=""
-    suffix="\n${DIM}Use --no-ignore to include it anyway.${RESET}"
-  fi
-  
-  if [[ "$IGNORE_REASON" == "yaml" ]]; then
-    printf "%s Directory '%s' is in ignore list%s${RESET}" "$prefix" "$dir_name" "${action:+, $action}" >&2
-  else
-    printf "%s Directory '%s' is ignored by .gitignore%s${RESET}" "$prefix" "$dir_name" "${action:+, $action}" >&2
-  fi
-  echo >&2
-  
-  [[ "$msg_type" == "error" ]] && printf "${DIM}Use --no-ignore to include it anyway.${RESET}\n" >&2
-  return 0
-}
-
-extract_dir_components() {
-  local path="$1"
-  local dir_part="${path%/*}"
-  
-  if [[ "$dir_part" == "$path" ]]; then
-    return
-  fi
-  
-  IFS='/' read -ra components <<< "$dir_part"
-  for comp in "${components[@]}"; do
-    echo "$comp"
-  done
-}
-
-# Traverse up the path to check if any parent directory is ignored
-# Traverse up the path to check if any parent directory is ignored
-check_parent_ignores() {
-  local path="$1"
-  local current_dir
-  current_dir=$(dirname "$path")
-  
-  # 1. OPTIMIZATION: Check YAML ignores in loop (fast, pure Bash)
-  while [[ "$current_dir" != "." && "$current_dir" != "/" && -n "$current_dir" ]]; do
-    if is_dir_ignored_yaml "$(basename "$current_dir")"; then
-      IGNORE_REASON="yaml"
-      print_dir_ignore_msg "$(basename "$current_dir")" "warning"
-      return 0
-    fi
-    current_dir=$(dirname "$current_dir")
-  done
-  
-  # 2. OPTIMIZATION: Check Git ignores ONCE on the full path (slow, spawns process)
-  # git check-ignore handles recursive parent checks natively.
-  if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]]; then
-    # If the path matches a gitignore rule, we need to determine WHICH directory is ignored
-    # to provide a helpful warning. We scan up the tree to find the culprit.
-    if git check-ignore -q "$path" 2>/dev/null; then
-       
-       local check_dir=$(dirname "$path")
-       while [[ "$check_dir" != "." && "$check_dir" != "/" && -n "$check_dir" ]]; do
-         if git check-ignore -q "$check_dir" 2>/dev/null; then
-             IGNORE_REASON="gitignore"
-             print_dir_ignore_msg "$(basename "$check_dir")" "warning"
-             return 0
-         fi
-         check_dir=$(dirname "$check_dir")
-       done
-    fi
-  fi
-  
-  return 0
-}
-
-# 6) FLAG PARSING
-SKIP_CONFIRM=false
-NO_IGNORE=false
-LIST_IGNORES=false
-SHOW_HELP=false
-SHOW_VERSION=false
-PRINT_CONTENT=false
-RESET_CONFIG=false
-NO_TREE=false
-CHANGED_ONLY=false
-IGNORE_OPS=()       # shared scratch for apply_ignore_ops
-TMP_IGNORE_OPS=()   # temporary ignores (this run only)
-PERM_IGNORE_OPS=()  # persistent ignores (writes config)
-raw_inputs=()
-
-while (( $# )); do
-  case "$1" in
-    --yes|-y)       SKIP_CONFIRM=true;    shift ;;
-    --no-ignore|-n) NO_IGNORE=true;       shift ;;
-    --list-ignores|-l) LIST_IGNORES=true; shift ;;
-    --print|-p)     PRINT_CONTENT=true;   shift ;;
-    --reset-config|-r) RESET_CONFIG=true; shift ;;
-    --no-tree|-t)   NO_TREE=true;         shift ;;
-    --help|-h)      SHOW_HELP=true;       shift ;;
-    --version|-v)   SHOW_VERSION=true;    shift ;;
-    --changed)     CHANGED_ONLY=true;     shift ;;
-    --ignore|-i)
-      shift
-      [[ $# -eq 0 ]] && { printf "%s\n" "${CLR_ERROR}Error: --ignore requires arguments.${RESET}" >&2; exit 1; }
-      ops_count=0
-      while (( $# )); do
-        [[ "$1" == --* ]] && break
-        case "$1" in
-          -y|-n|-l|-p|-r|-t|-h|-v|-i) break ;;
-        esac
-        if [[ "$1" =~ ^(d[+-].+|[+-].+)$ ]]; then
-          TMP_IGNORE_OPS+=( "$1" )
-          ((ops_count++))
-          shift
+        if [[ "$t" == *.* || "$known_file" == true ]]; then
+          # Has extension or known basename — definitely a file
+          printf "${C_WARN}Warning: '%s' not found at project root.${RESET}\n" "$t" >&2
+          printf "\n  ${DIM}To find it in subdirectories:${RESET}\n" >&2
+          printf "    ${C_OK}catclip . --only \"%s\"${RESET}         ${DIM}# all matches${RESET}\n" "$t" >&2
+          printf "    ${C_OK}catclip src --only \"%s\"${RESET}       ${DIM}# within src/${RESET}\n" "$t" >&2
         else
-          break
+          # Ambiguous — could be file or directory
+          printf "${C_WARN}Warning: No file or directory '%s' found (scope %d).${RESET}\n" "$t" $((idx+1)) >&2
+          printf "\n  ${DIM}If it's a file in a subdirectory:${RESET}\n" >&2
+          printf "    ${C_OK}catclip . --only \"%s\"${RESET}\n" "$t" >&2
+          printf "\n  ${DIM}If it's inside an ignored directory:${RESET}\n" >&2
+          printf "    ${C_OK}catclip . --include \"dir/\"${RESET}\n" >&2
         fi
-      done
-      if (( ops_count == 0 )); then
-        printf "%s\n" "${CLR_ERROR}Error: --ignore requires at least one operation (e.g. +'.log' d-build).${RESET}" >&2
-        exit 1
       fi
-      ;;
-    --ignore-always)
-      shift
-      [[ $# -eq 0 ]] && { printf "%s\n" "${CLR_ERROR}Error: --ignore-always requires arguments.${RESET}" >&2; exit 1; }
-      ops_count=0
-      while (( $# )); do
-        [[ "$1" == --* ]] && break
-        case "$1" in
-          -y|-n|-l|-p|-r|-t|-h|-v|-i) break ;;
-        esac
-        if [[ "$1" =~ ^(d[+-].+|[+-].+)$ ]]; then
-          PERM_IGNORE_OPS+=( "$1" )
-          ((ops_count++))
-          shift
+    else
+      local filename="${t##*/}" dir_path="${t%/*}"
+      if resolved=$(resolve_chained_path "$dir_path" "$is_no_ignore"); then
+        local full="$resolved/$filename"
+        if [[ -f "$full" && -r "$full" ]]; then
+          local clean="${full#./}"
+          if [[ "$is_no_ignore" != true ]] && is_ignored "$clean"; then
+            local rule=""
+            rule=$(find_matching_rule "$clean") || true
+            printf "\n%s\n" "${C_ERR}Error: '${clean}' is ignored by rule '${rule}' in .hiss${RESET}" >&2
+            printf "\n  ${DIM}To include it this run:${RESET}   ${C_OK}catclip . --include \"%s\"${RESET}\n" "$rule" >&2
+            printf "  ${DIM}To include everything:${RESET}   ${C_OK}catclip . --include \"*\"${RESET}\n" >&2
+          else
+            is_text_file "$full" && echo "$clean" >> "$discovered_file"
+          fi
+        elif [[ -d "$full" ]]; then
+          if [[ "$is_no_ignore" != true ]] && is_dir_blocked "$full"; then
+            local dirname="${full%/}"; dirname="${dirname##*/}"
+            printf "\n%s\n" "${C_ERR}Error: '${full#./}' is ignored by .hiss${RESET}" >&2
+            printf "\n  ${DIM}To include it this run:${RESET}   ${C_OK}catclip . --include \"${dirname}/\"${RESET}\n" >&2
+            printf "  ${DIM}To include everything:${RESET}   ${C_OK}catclip . --include \"*\"${RESET}\n" >&2
+            printf "  ${DIM}To remove permanently:${RESET}   ${C_OK}catclip --hiss${RESET} ${DIM}(delete the rule)${RESET}\n" >&2
+          else
+            discover_files "$full" "$is_no_ignore" "$discovered_file" "$only_csv"
+          fi
         else
-          break
+          printf "${C_WARN}Warning: Target '%s' not found (scope %d).${RESET}\n" "$t" $((idx+1)) >&2
         fi
-      done
-      if (( ops_count == 0 )); then
-        printf "%s\n" "${CLR_ERROR}Error: --ignore-always requires at least one operation (e.g. +'.log' d+build).${RESET}" >&2
-        exit 1
+      else
+        printf "${C_WARN}Warning: Target '%s' not found (scope %d).${RESET}\n" "$t" $((idx+1)) >&2
       fi
-      ;;
-    --) shift; raw_inputs+=( "$@" ); break ;;
-    --*) 
-      printf "%s\n" "${CLR_ERROR}Error: Unknown option '$1'${RESET}" >&2
-      printf "Try '${CLR_SUCCESS}catclip${RESET} --help' for available options.\n" >&2
+    fi
+  done
+
+  # ── --changed filter ──
+  # [Point 6] Include staged + unstaged + untracked regardless of HEAD.
+  if [[ "$is_changed" == true ]]; then
+    if [[ "$IS_GIT" == true ]]; then
+      local changed_file
+      changed_file=$(mktmp)
+
+      local has_head=false
+      git rev-parse --verify HEAD >/dev/null 2>&1 && has_head=true
+      if [[ "$has_head" == true ]]; then
+        { git diff --name-only HEAD
+          git diff --name-only --cached
+          git ls-files --others --exclude-standard
+        } 2>/dev/null | sort -u > "$changed_file"
+      else
+        { git diff --name-only --cached
+          git diff --name-only
+          git ls-files --others --exclude-standard
+        } 2>/dev/null | sort -u > "$changed_file"
+      fi
+
+      local filtered
+      filtered=$(mktmp)
+      comm -12 <(sort -u "$discovered_file") "$changed_file" > "$filtered"
+      cat "$filtered" > "$discovered_file"
+    else
+      printf "${C_WARN}Warning: --changed requires a git repo (scope %d).${RESET}\n" $((idx+1)) >&2
+      printf "  ${DIM}This directory is not inside a git repository.${RESET}\n" >&2
+    fi
+  fi
+
+  # ── Filter pipeline ──
+  sort -u "$discovered_file" \
+    | if [[ "$is_no_ignore" != true && "$IS_GIT" == true && "$HAS_GITIGNORE" == true ]]; then
+        batch_git_filter
+      else
+        cat
+      fi \
+    | single_pass_filter "$is_no_ignore" "$only_csv" \
+    | if [[ -n "$contains_pattern" ]]; then
+        local contains_in contains_out
+        contains_in=$(mktmp)
+        contains_out=$(mktmp)
+        cat > "$contains_in"
+        if [[ -s "$contains_in" ]]; then
+          tr '\n' '\0' < "$contains_in" \
+            | xargs -0 grep -lE -- "$contains_pattern" 2>/dev/null \
+            > "$contains_out" || true
+          cat "$contains_out"
+        fi
+      else
+        cat
+      fi
+
+  # ── Restore original blocklist ──
+  ignore_dirs=( ${saved_ignore_dirs[@]+"${saved_ignore_dirs[@]}"} )
+  ignore_files=( ${saved_ignore_files[@]+"${saved_ignore_files[@]}"} )
+  build_ignore_patterns
+}
+
+get_scope_label() {
+  local idx="$1"
+  local t="${SCOPE_TARGETS[$idx]}"
+  [[ -z "$t" ]] && t="."
+  local desc="${C_DIR}${t//,/, }${RESET}"
+  local flags=""
+
+  [[ "${SCOPE_CHANGED[$idx]}" == true ]] && flags="${flags} ${C_GIT}--changed${RESET}"
+  local o="${SCOPE_ONLY[$idx]}"
+  [[ -n "$o" ]] && flags="${flags} ${C_OK}--only ${o//,/, }${RESET}"
+  local sk="${SCOPE_SKIP[$idx]}"
+  [[ -n "$sk" ]] && flags="${flags} ${C_WARN}--exclude ${sk}${RESET}"
+  local fi_="${SCOPE_FORCE[$idx]}"
+  [[ -n "$fi_" ]] && flags="${flags} ${C_OK}--include ${fi_}${RESET}"
+  [[ "${SCOPE_NO_IGNORE[$idx]}" == true ]] && flags="${flags} ${C_ERR}--include \"*\"${RESET}"
+  local ct="${SCOPE_CONTAINS[$idx]}"
+  [[ -n "$ct" ]] && flags="${flags} ${C_OK}--contains ${ct}${RESET}"
+
+  [[ -n "$flags" ]] && desc="$desc ${DIM}(${flags# })${RESET}"
+  echo "$desc"
+}
+
+# ==============================================================================
+# HISS MANAGEMENT
+# ==============================================================================
+
+open_hiss() {
+  ensure_config
+  local editor="${VISUAL:-${EDITOR:-nano}}"
+  if ! command -v "${editor%% *}" &>/dev/null; then
+    editor="nano"
+    if ! command -v nano &>/dev/null; then
+      printf "%s\n" "${C_ERR}Error: No editor found. Set \$EDITOR or install nano.${RESET}" >&2
       exit 1
-      ;;
-    *)   raw_inputs+=( "$1" ); shift ;;
-  esac
-done
-
-[[ "$SHOW_HELP" == true ]] && { print_help; exit 0; }
-[[ "$SHOW_VERSION" == true ]] && { echo "catclip $VERSION"; exit 0; }
-
-if [[ "$RESET_CONFIG" == true ]]; then
-  echo "${CLR_WARN}This will overwrite ${BOLD}$CONFIG${RESET}${CLR_WARN} with factory defaults.${RESET}" >&2
-  prompt_yn "Are you sure? [y/N] " "n"
-  if [[ "$PROMPT_RESPONSE" == "y" ]]; then
-    get_default_config > "$CONFIG"
-    echo "${CLR_SUCCESS}Configuration restored.${RESET}" >&2
-  else
-    echo "Cancelled." >&2
-  fi
-  exit 0
-fi
-
-# 7) LOAD IGNORES
-ignore_dirs=()
-ignore_files=()
-parse_error=false
-error_msg=""
-
-if [[ -r "$CONFIG" ]]; then
-  while IFS='|' read -r type value; do
-    if [[ "$type" == "ERR" ]]; then
-      parse_error=true
-      error_msg="$value"
-      break
-    elif [[ "$type" == "D" ]]; then
-      ignore_dirs+=( "$value" )
-    elif [[ "$type" == "F" ]]; then
-      ignore_files+=( "$value" )
     fi
-  done < <(awk '
-    { raw = $0; sub(/#.*/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); }
-    length($0) == 0 { next }
-    /^ignore_dirs:/  { block="D"; next }
-    /^ignore_files:/ { block="F"; next }
-    /^- / {
-      if (block == "") { print "ERR|Orphaned item: " raw; exit 1 }
-      sub(/^- /, ""); gsub(/^["\x27]|["\x27]$/, "");
-      if (block == "D") print "D|" $0;
-      if (block == "F") print "F|" $0;
-      next
-    }
-    { print "ERR|Syntax error: " raw; exit 1 }
-  ' "$CONFIG")
-fi
-
-if [[ "$parse_error" == true ]]; then
-  printf "\n%s\n" "${CLR_ERROR}Config Corrupted in ${BOLD}$CONFIG${RESET}" >&2
-  printf "%s\n" "${CLR_ERROR}➤ $error_msg${RESET}" >&2
-  prompt_yn $'\n'"${CLR_WARN}Would you like to reset to factory defaults? [y/N]${RESET} " "n"
-  if [[ "$PROMPT_RESPONSE" == "y" ]]; then
-    get_default_config > "$CONFIG"
-    echo "${CLR_SUCCESS}Configuration reset. Retrying...${RESET}" >&2
-    exec "$0" "$@"
-  else
-    echo "${CLR_ERROR}Aborting. Please fix the file manually.${RESET}" >&2
-    exit 1
   fi
-fi
+  printf "%s\n" "${DIM}Opening $(short_path "$GLOBAL_HISS") in ${editor%% *}...${RESET}" >&2
+  $editor "$GLOBAL_HISS"
+}
 
-# Check for empty config (both arrays empty = likely broken/cleared config)
-if (( ${#ignore_dirs[@]} == 0 && ${#ignore_files[@]} == 0 )); then
-  printf "\n%s\n" "${CLR_WARN}Config Empty in ${BOLD}$CONFIG${RESET}" >&2
-  printf "%s\n" "${DIM}No ignore rules defined. Press y to restore defaults, or continue using .gitignore only.${RESET}" >&2
-  prompt_yn $'\n'"${CLR_WARN}Would you like to reset to factory defaults? [y/N]${RESET} " "n"
-  if [[ "$PROMPT_RESPONSE" == "y" ]]; then
-    get_default_config > "$CONFIG"
-    echo "${CLR_SUCCESS}Configuration reset. Retrying...${RESET}" >&2
-    exec "$0" "$@"
-  else
-    echo "${CLR_WARN}Continuing with empty config...${RESET}" >&2
+# ==============================================================================
+# MAIN
+# ==============================================================================
+
+main() {
+  IS_GIT=false
+  HAS_GITIGNORE=false
+  GIT_ROOT=""
+  if [[ "$HAS_GIT" == true ]]; then
+    if GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
+      IS_GIT=true
+      [[ -f "$GIT_ROOT/.gitignore" ]] && HAS_GITIGNORE=true
+    fi
   fi
-fi
 
-# 7.5) GIT CONTEXT DETECTION (shared for list-ignores and banner)
-IS_GIT=false
-HAS_GITIGNORE=false
-GIT_ROOT=""
-if [[ "$HAS_GIT" == true ]]; then
-  if GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
-    IS_GIT=true
-    [[ -f "$GIT_ROOT/.gitignore" ]] && HAS_GITIGNORE=true
-  fi
-fi
+  ensure_config
+  load_ignores
 
+  # No-op now (is_ignored uses arrays directly), but called by
+  # evaluate_scope after --include and --exclude modify the blocklist.
+  build_ignore_patterns
 
-# 8) CONFIG UPDATE LOGIC
-apply_ignore_ops() {
-  changes_log=()
-  added_files=()
-  removed_files=()
-  added_dirs=()
-  removed_dirs=()
+  # ── Arg parsing ──
+  # [Point 9] Scope accumulator state is global, not local to main.
+  # close_scope() is a nested function that mutates these — using globals
+  # makes the mutation explicit and survives refactoring.
+  local skip_confirm=false print_content=false no_tree=false preview=false
+  local any_no_ignore=false any_changed=false
 
-  for op in "${IGNORE_OPS[@]}"; do
-    case "$op" in
-      d+*)
-           dir_name="${op:2}"
-           ignore_dirs+=( "$dir_name" )
-           added_dirs+=( "$dir_name" )
-           changes_log+=( "${CLR_SUCCESS}+${RESET} ${CLR_DIR}${dir_name}${RESET}" )
-           ;;
-      d-*)
-           new_dirs=()
-           for d in "${ignore_dirs[@]}"; do [[ "$d" != "${op:2}" ]] && new_dirs+=("$d"); done
-           ignore_dirs=("${new_dirs[@]}")
-           removed_dirs+=( "${op:2}" )
-           changes_log+=( "${CLR_ERROR}-${RESET} ${CLR_DIR}${op:2}${RESET}" )
-           ;;
-      +*)
-           file_pattern="${op:1}"
-           ignore_files+=( "$file_pattern" )
-           added_files+=( "$file_pattern" )
-           changes_log+=( "${CLR_SUCCESS}+${RESET} ${file_pattern}" )
-           ;;
-      -*)
-           new_files=()
-           for f in "${ignore_files[@]}"; do [[ "$f" != "${op:1}" ]] && new_files+=("$f"); done
-           ignore_files=("${new_files[@]}")
-           removed_files+=( "${op:1}" )
-           changes_log+=( "${CLR_ERROR}-${RESET} ${op:1}" )
-           ;;
+  # Flush accumulated scope state into the parallel scope arrays.
+  close_scope() {
+    # Flush if we have targets OR any modifier was set (implicit "." target)
+    local _has_modifiers=false
+    if [[ "$_cur_changed" == true || "$_cur_no_ignore" == true || -n "$_cur_contains" ]] \
+       || (( ${#_cur_only[@]} > 0 || ${#_cur_skip[@]} > 0 || ${#_cur_force[@]} > 0 )); then
+      _has_modifiers=true
+    fi
+
+    if (( ${#_cur_targets[@]} > 0 )) || [[ "$_has_modifiers" == true ]]; then
+
+      local t_str="" o_str="" s_str="" f_str="" sep=""
+      if (( ${#_cur_targets[@]} > 0 )); then
+        local t; for t in "${_cur_targets[@]}"; do t_str="${t_str}${sep}${t}"; sep=","; done
+      else
+        t_str="."
+      fi
+      sep=""
+      local p; for p in ${_cur_only[@]+"${_cur_only[@]}"}; do o_str="${o_str}${sep}${p}"; sep=","; done
+      sep=""
+      for p in ${_cur_skip[@]+"${_cur_skip[@]}"}; do s_str="${s_str}${sep}${p}"; sep=","; done
+      sep=""
+      for p in ${_cur_force[@]+"${_cur_force[@]}"}; do f_str="${f_str}${sep}${p}"; sep=","; done
+
+      add_scope "$t_str" "$_cur_changed" "$_cur_no_ignore" "$o_str" "$s_str" "$f_str" "$_cur_contains"
+
+      _cur_targets=(); _cur_changed=false; _cur_no_ignore=false
+      _cur_only=(); _cur_skip=(); _cur_force=(); _cur_contains=""
+    fi
+  }
+
+  while (( $# )); do
+    case "$1" in
+      -h|--help)      print_help; exit 0 ;;
+      --help-all)     print_help_all; exit 0 ;;
+      --version|-V)   echo "catclip $VERSION"; exit 0 ;;
+      -v|--verbose)   VERBOSE=true; shift ;;
+      -q|--quiet)     QUIET=true; shift ;;
+      -y|--yes)       skip_confirm=true; shift ;;
+      -p|--print)     print_content=true; shift ;;
+      -t|--no-tree)   no_tree=true; shift ;;
+      --preview)      preview=true; shift ;;
+      --hiss) open_hiss; exit 0 ;;
+      --hiss-reset)
+        local short_hiss
+        short_hiss=$(short_path "$GLOBAL_HISS")
+        printf "%s\n" "${C_WARN}This will overwrite ${BOLD}${short_hiss}${RESET}${C_WARN} with defaults.${RESET}" >&2
+        if prompt_yn "Are you sure? [y/N]" "n"; then
+          mkdir -p "$CONFIG_DIR"
+          get_default_hiss > "$GLOBAL_HISS"
+          printf "%s\n" "${C_OK}Configuration restored.${RESET}" >&2
+        else
+          printf "Cancelled.\n" >&2
+        fi
+        exit 0
+        ;;
+      --changed)
+        _cur_changed=true; any_changed=true; shift
+        ;;
+      --only)
+        shift
+        if (( $# == 0 )); then
+          printf "%s\n" "${C_ERR}Error: --only requires a pattern.${RESET}" >&2
+          printf "  Example: catclip src --only '*.ts'\n" >&2
+          exit 2
+        fi
+        _cur_only+=( "$1" ); shift
+        ;;
+      --then)
+        close_scope; shift
+        ;;
+      --)
+        shift
+        while (( $# )); do
+          _cur_targets+=( "$1" ); shift
+        done
+        break
+        ;;
+      --include)
+        shift
+        if (( $# == 0 )); then
+          printf "%s\n" "${C_ERR}Error: --include requires a pattern.${RESET}" >&2
+          printf "  Example: catclip src --include 'tests/'\n" >&2
+          exit 2
+        fi
+        if [[ "$1" == "*" ]]; then
+          _cur_no_ignore=true; any_no_ignore=true
+        else
+          local _inc_pats=()
+          IFS=',' read -ra _inc_pats <<< "$1"
+          local _ip; for _ip in "${_inc_pats[@]}"; do
+            [[ -n "$_ip" ]] && _cur_force+=( "$_ip" )
+          done
+        fi
+        shift
+        ;;
+      --exclude)
+        shift
+        if (( $# == 0 )); then
+          printf "%s\n" "${C_ERR}Error: --exclude requires a pattern.${RESET}" >&2
+          printf "  Example: catclip src --exclude '*.test.*'\n" >&2
+          exit 2
+        fi
+        local _exc_pats=()
+        IFS=',' read -ra _exc_pats <<< "$1"
+        local _ep; for _ep in "${_exc_pats[@]}"; do
+          [[ -n "$_ep" ]] && _cur_skip+=( "$_ep" )
+        done
+        shift
+        ;;
+      --contains=*)
+        printf "%s\n" "${C_ERR}Error: --contains requires a space before the pattern.${RESET}" >&2
+        printf "  Use: catclip src --contains 'pattern'\n" >&2
+        printf "  Not: catclip src --contains='pattern'\n" >&2
+        exit 2
+        ;;
+      --contains)
+        shift
+        if (( $# == 0 )); then
+          printf "%s\n" "${C_ERR}Error: --contains requires a regex pattern.${RESET}" >&2
+          printf "  Example: catclip src --contains 'TODO'\n" >&2
+          exit 2
+        fi
+        if [[ "$1" == *'*'* && "$1" != *'.'* && "$1" != *'['* && "$1" != *'|'* && "$1" != *'\\'* ]]; then
+          printf "${C_WARN}Warning: --contains uses regex, not globs. Did you mean '.*' instead of '*'?${RESET}\n" >&2
+          printf "  ${DIM}Example: --contains 'use.*Context' (not 'use*Context')${RESET}\n" >&2
+        fi
+        _cur_contains="$1"; shift
+        ;;
+      --*)
+        printf "%s\n" "${C_ERR}Error: Unknown option '$1'${RESET}" >&2
+        printf "  Run 'catclip --help' for available options.\n" >&2
+        exit 2
+        ;;
+      -?*)
+        printf "%s\n" "${C_ERR}Error: Unknown option '$1'${RESET}" >&2
+        printf "  Run 'catclip --help' for available options.\n" >&2
+        exit 2
+        ;;
+      *)
+        _cur_targets+=( "$1" ); shift
+        ;;
     esac
   done
-}
+  close_scope
 
-if (( ${#PERM_IGNORE_OPS[@]} > 0 )); then
-  IGNORE_OPS=( "${PERM_IGNORE_OPS[@]}" )
-  printf "%s\n" "${BOLD}Updating ignore list in ${DIM}$CONFIG${RESET}" >&2
-  apply_ignore_ops
+  local num_scopes
+  num_scopes=$(scope_count)
 
-  {
-    echo "ignore_dirs:"
-    for d in "${ignore_dirs[@]}"; do echo "  - $d"; done
-    echo "ignore_files:"
-    for f in "${ignore_files[@]}"; do echo "  - \"$f\""; done
-  } >"$CONFIG"
-
-  printf "\n${BOLD}New Configuration:${RESET}\n" >&2
-  printf "\n${BOLD}Ignored Directories (YAML):${RESET}\n" >&2
-  for d in "${ignore_dirs[@]}"; do printf "  ${CLR_ERROR}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d" >&2; done
-  printf "\n${BOLD}Ignored Files (YAML):${RESET}\n" >&2
-  for f in "${ignore_files[@]}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f" >&2; done
-
-  printf "\n${BOLD}Changes applied:${RESET}\n" >&2
-  for change in "${changes_log[@]}"; do printf "  %s\n" "$change" >&2; done
-
-  if [[ "$HAS_GIT" == true ]] && git rev-parse --show-toplevel &>/dev/null; then
-    printf "\n${CLR_GIT}Note: Files listed in .gitignore remain excluded automatically.${RESET}\n" >&2
-  else
-    printf "\n${DIM}Note: If used inside a Git project, .gitignore rules will also apply.${RESET}\n" >&2
+  if (( num_scopes == 0 )); then
+    add_scope "." "false" "false" "" "" "" ""
+    num_scopes=1
   fi
-  exit 0
-fi
 
-if (( ${#TMP_IGNORE_OPS[@]} > 0 )); then
-  IGNORE_OPS=( "${TMP_IGNORE_OPS[@]}" )
-  printf "%s\n" "${BOLD}${CLR_WARN}Temporary ignore (this run):${RESET}" >&2
-  apply_ignore_ops
-  if (( ${#added_files[@]} > 0 )); then
-    printf "${BOLD}Ignored files:${RESET}\n" >&2
-    for f in "${added_files[@]}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f" >&2; done
-  fi
-  if (( ${#added_dirs[@]} > 0 )); then
-    printf "${BOLD}Ignored directories:${RESET}\n" >&2
-    for d in "${added_dirs[@]}"; do printf "  ${CLR_ERROR}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d" >&2; done
-  fi
-  if (( ${#removed_files[@]} > 0 )); then
-    printf "${BOLD}Unignored files:${RESET}\n" >&2
-    for f in "${removed_files[@]}"; do printf "  ${CLR_SUCCESS}•${RESET} %s\n" "$f" >&2; done
-  fi
-  if (( ${#removed_dirs[@]} > 0 )); then
-    printf "${BOLD}Unignored directories:${RESET}\n" >&2
-    for d in "${removed_dirs[@]}"; do printf "  ${CLR_SUCCESS}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d" >&2; done
-  fi
-fi
+  # ── Phase 1: Discovery ──
+  local t_discovery
+  t_discovery=$(timer_start)
+  local list_file
+  list_file=$(mktmp)
+  local total_files=0
 
-# 9) LIST IGNORES COMMAND
-if [[ "$LIST_IGNORES" == true ]]; then
-  printf "%s\n" "${BOLD}Current Configuration${RESET}" >&2
-  printf "${DIM}%s${RESET}\n" "$CONFIG" >&2
-  
-  printf "\n${BOLD}Ignored Directories (YAML):${RESET}\n" >&2
-  for d in "${ignore_dirs[@]:-}"; do printf "  ${CLR_ERROR}•${RESET} ${CLR_DIR}%s${RESET}\n" "$d" >&2; done
-  
-  printf "\n${BOLD}Ignored Files (YAML):${RESET}\n" >&2
-  for f in "${ignore_files[@]:-}"; do printf "  ${CLR_WARN}•${RESET} %s\n" "$f" >&2; done
+  # Only show scope headers when there are multiple scopes.
+  if (( num_scopes > 1 )); then
+    info "${BOLD}Scanning...${RESET}\n"
+  fi
 
-  if [[ "$IS_GIT" == true ]]; then
-    git_ignore_file="$GIT_ROOT/.gitignore"
-    if [[ -f "$git_ignore_file" ]]; then
-      printf "\n${BOLD}Ignored Files (Project .gitignore):${RESET}\n" >&2
-      printf "${DIM}%s${RESET}\n" "$git_ignore_file" >&2
-      grep -vE '^\s*#|^\s*$' "$git_ignore_file" | while read -r line; do
-        printf "  ${CLR_GIT}•${RESET} %s\n" "$line" >&2
-      done
-    else
-      printf "\n${DIM}(No .gitignore found at %s)${RESET}\n" "$GIT_ROOT" >&2  
+  local i
+  for (( i = 0; i < num_scopes; i++ )); do
+    if (( num_scopes > 1 )); then
+      local label
+      label=$(get_scope_label "$i")
+      info "${BOLD}Scope %d:${RESET} %s\n" $((i+1)) "$label"
     fi
-  fi
-  exit 0
-fi
 
-# 10) TARGET RESOLUTION (NEW SMART PATH RESOLUTION)
-IS_GIT=false
-HAS_GITIGNORE=false
-GIT_ROOT=""
-if [[ "$HAS_GIT" == true ]]; then
-  if GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
-    IS_GIT=true
-    [[ -f "$GIT_ROOT/.gitignore" ]] && HAS_GITIGNORE=true
-  fi
-fi
+    local scope_result
+    scope_result=$(mktmp)
+    evaluate_scope "$i" > "$scope_result"
 
-if [[ "$CHANGED_ONLY" == true ]]; then
-  if [[ "$IS_GIT" != true ]]; then
-    printf "%s\n" "${CLR_ERROR}Error: --changed requires a git repository.${RESET}" >&2
+    local n
+    n=$(count_lines "$scope_result")
+    if (( num_scopes > 1 )); then
+      info "  ${C_LABEL}%d %s${RESET}\n\n" "$n" "$(plural "$n")"
+    fi
+    cat "$scope_result" >> "$list_file"
+    total_files=$((total_files + n))
+  done
+
+  sort -u "$list_file" -o "$list_file"
+  local final_count
+  final_count=$(count_lines "$list_file")
+  # Dedup message is verbose-only — not useful at default verbosity.
+  if (( final_count != total_files && num_scopes > 1 )); then
+    vlog "Deduplicated: $final_count unique (from $total_files across scopes)"
+  fi
+  total_files="$final_count"
+  timer_end "$t_discovery" "Discovery"
+
+  if (( total_files == 0 )); then
+    # Context-aware empty message: distinguish --changed from general empty.
+    if [[ "$HAD_FUZZY_FAIL" == true ]]; then
+      # User saw matches but didn't select — no diagnostic needed
+      :
+    elif [[ "$any_changed" == true ]]; then
+      printf "%s\n" "${C_WARN}No changed files found.${RESET}" >&2
+      printf "  ${DIM}Your working tree may be clean, or the target has no modifications.${RESET}\n" >&2
+      printf "  ${DIM}Run without --changed to copy all files.${RESET}\n" >&2
+    else
+      printf "%s\n" "${C_WARN}No text files found matching your criteria.${RESET}" >&2
+      printf "\n  ${DIM}Possible causes:${RESET}\n" >&2
+      printf "  ${DIM}  1. Directory is empty or contains only binary files${RESET}\n" >&2
+      printf "  ${DIM}  2. All files matched by ignore rules${RESET}\n" >&2
+      printf "  ${DIM}  3. Typo in target name${RESET}\n" >&2
+      printf "\n  ${DIM}Try: catclip --hiss                   # view/edit ignore rules${RESET}\n" >&2
+      printf "  ${DIM}     catclip . --include \"*\"          # disable all ignore rules${RESET}\n" >&2
+    fi
     exit 1
   fi
 
-  if (( ${#raw_inputs[@]} > 0 )); then
-    for scope in "${raw_inputs[@]}"; do
-      if contains_parent_traversal "$scope"; then
-        printf "%s\n" "${CLR_ERROR}Error: Cannot traverse above working directory: '$scope'${RESET}" >&2
-        exit 1
-      fi
-      if is_absolute_path "$scope"; then
-        printf "%s\n" "${CLR_ERROR}Error: Absolute paths are not allowed: '$scope'${RESET}" >&2
-        exit 1
-      fi
-      if [[ ! -e "$scope" ]]; then
-        printf "%s\n" "${CLR_ERROR}Error: Target '$scope' does not exist.${RESET}" >&2
-        exit 1
-      fi
-    done
-  fi
-
-  has_head=false
-  if git rev-parse --verify HEAD >/dev/null 2>&1; then
-    has_head=true
-  fi
-
-  changed_files=()
-  while IFS= read -r path; do
-    [[ -z "$path" ]] && continue
-    [[ ! -e "$GIT_ROOT/$path" ]] && continue
-    if ! is_text_file "$GIT_ROOT/$path"; then
-      continue
-    fi
-
-    if [[ "$NO_IGNORE" != true ]]; then
-      if check_file_ignore "$(basename "$path")"; then
-        continue
-      fi
-
-      if [[ "$IS_GIT" == true ]] && git check-ignore -q "$path" 2>/dev/null; then
-        continue
-      fi
-
-      parent_dir="$path"
-      skip=false
-      while [[ "$parent_dir" != "." && "$parent_dir" != "/" && -n "$parent_dir" ]]; do
-        parent_dir=$(dirname "$parent_dir")
-        [[ "$parent_dir" == "." || "$parent_dir" == "/" ]] && break
-        if is_dir_ignored_yaml "$(basename "$parent_dir")"; then
-          skip=true
-          break
-        fi
-      done
-      [[ "$skip" == true ]] && continue
-    fi
-
-    changed_files+=( "$path" )
-  done < <(cd "$GIT_ROOT" && {
-    if [[ "$has_head" == true ]]; then
-      if (( ${#raw_inputs[@]} > 0 )); then
-        git diff --name-only HEAD -- "${raw_inputs[@]}"
-      else
-        git diff --name-only HEAD
-      fi
+  # ── Phase 2: Size & tokens ──
+  local t_size
+  t_size=$(timer_start)
+  local total_bytes=0
+  # For --preview, we need per-file sizes anyway, so capture them here
+  # and derive the total — avoids running stat twice.
+  local sizes_file=""
+  if [[ "$no_tree" == false ]]; then
+    sizes_file=$(mktmp)
+    if [[ "$PLATFORM" == "macos" ]]; then
+      paste "$list_file" <(tr '\n' '\0' < "$list_file" | xargs -0 stat -f %z 2>/dev/null) > "$sizes_file"
     else
-      if (( ${#raw_inputs[@]} > 0 )); then
-        git diff --name-only --cached -- "${raw_inputs[@]}"
-        git diff --name-only -- "${raw_inputs[@]}"
-      else
-        git diff --name-only --cached
-        git diff --name-only
-      fi
+      paste "$list_file" <(tr '\n' '\0' < "$list_file" | xargs -0 stat -c %s 2>/dev/null) > "$sizes_file"
     fi
-
-    if (( ${#raw_inputs[@]} > 0 )); then
-      git ls-files --others --exclude-standard -- "${raw_inputs[@]}"
-    else
-      git ls-files --others --exclude-standard
-    fi
-  } | sort -u)
-
-  if (( ${#changed_files[@]} == 0 )); then
-    if (( ${#raw_inputs[@]} > 0 )); then
-      printf "%s\n" "${CLR_WARN}No files changed since the last commit for the selected targets.${RESET}" >&2
-    else
-      printf "%s\n" "${CLR_WARN}No files changed since the last commit.${RESET}" >&2
-    fi
-    exit 0
-  fi
-
-  raw_inputs=( "${changed_files[@]}" )
-fi
-
-(( ${#raw_inputs[@]} == 0 )) && raw_inputs=( "." )
-
-file_targets=()
-dir_targets=()
-
-for arg in "${raw_inputs[@]}"; do
-  
-  if contains_parent_traversal "$arg"; then
-    printf "%s\n" "${CLR_ERROR}Error: Cannot traverse above working directory: '$arg'${RESET}" >&2
-    printf "${DIM}Hint: catclip must be run from project root and cannot access parent directories.${RESET}\n" >&2
-    exit 1
-  fi
-
-  if is_absolute_path "$arg"; then
-    printf "%s\n" "${CLR_ERROR}Error: Absolute paths are not allowed: '$arg'${RESET}" >&2
-    printf "${DIM}Hint: Use a relative path from the project root.${RESET}\n" >&2
-    exit 1
-  fi
-  
-  # BRANCH 1: Single word (no slashes) - local file/dir or fuzzy search
-  if ! has_slashes "$arg"; then
-    if [[ -d "$arg" ]]; then
-      # Local directory exists - check if ignored
-      if is_dir_ignored "./$arg"; then
-        print_dir_ignore_msg "$arg" "error"
-        exit 1
-      fi
-      dir_targets+=( "./$arg" )
-      
-      elif resolved_dir=$(fuzzy_search_dir "$arg"); then
-      # Found matching directories via fuzzy search
-      if is_dir_ignored "$resolved_dir"; then
-        resolved_name=$(basename "$resolved_dir")
-        print_dir_ignore_msg "$resolved_name" "error"
-        exit 1
-      fi
-      dir_targets+=( "$resolved_dir" )
-      
-    else
-      # Check exit code of fuzzy search (it runs in subshell for command substitution)
-      # But since we used 'elif', we lost the exit code? No, 'elif command' failure exit status is available?
-      # Actually, clean way is to re-check if we need to abort.
-      # Bash behavior: if the condition failed, $? holds the return code.
-      ret=$?
-       if (( ret == 2 )); then exit 2; fi
-       
-       if [[ -f "$arg" ]]; then
-        # Local file exists (only match if no directory found)
-        if check_file_ignore "$arg"; then
-          printf "%s\n" "${CLR_ERROR}Error: File '$arg' is ignored by pattern.${RESET}" >&2
-          printf "${DIM}Use --no-ignore to include it anyway.${RESET}\n" >&2
-          exit 1
-        fi
-        file_targets+=( "./$arg" )
-      
-      elif [[ "$arg" == *.* ]]; then
-      # Looks like a filename but not found
-      printf "%s\n" "${CLR_ERROR}Error: File '$arg' not found in working directory.${RESET}" >&2
-      printf "\n${DIM}Hint: For files outside working directory, use:${RESET}\n" >&2
-      printf "  ${CLR_SUCCESS}directory/filename${RESET}       ${DIM}(fuzzy search directory first)${RESET}\n" >&2
-      printf "  ${CLR_SUCCESS}full/path/to/file${RESET}        ${DIM}(relative path from root)${RESET}\n" >&2
-      exit 1
-      
-    else
-      # No directory found, not a file
-      printf "%s\n" "${CLR_ERROR}Error: No directory matching '$arg' found.${RESET}" >&2
-      printf "\n${DIM}Searched for directories containing '%s' in their name.${RESET}\n" "$arg" >&2
-      printf "\n${DIM}Try:${RESET}\n" >&2
-      printf "  ${CLR_SUCCESS}catclip .${RESET}                ${DIM}(copy current directory)${RESET}\n" >&2
-      printf "  ${CLR_SUCCESS}catclip src${RESET}              ${DIM}(fuzzy match 'src' directory)${RESET}\n" >&2
-      exit 1
-    fi
-    fi
-    
-  # BRANCH 2: Has slashes - path resolution (exact or chained)
+    total_bytes=$(awk -F'\t' '{s+=$2} END {print s+0}' "$sizes_file")
   else
-    filename="${arg##*/}"
-    dir_path="${arg%/*}"
-    
-    # First check if exact path already exists
-    if [[ -e "$arg" ]]; then
-      # Exact path exists - use it directly
-      if [[ -f "$arg" ]]; then
-        if check_file_ignore "$filename"; then
-          printf "%s\n" "${CLR_ERROR}Error: File '$filename' is ignored by pattern.${RESET}" >&2
-          printf "${DIM}Use --no-ignore to include it anyway.${RESET}\n" >&2
-          exit 1
-        fi
-        
-        # Check if parent directory is ignored
-        check_parent_ignores "$arg"
-        
-        if ! is_text_file "$arg"; then
-          printf "%s\n" "${CLR_ERROR}Error: File '$filename' is a binary file and cannot be copied.${RESET}" >&2
-          exit 1
-        fi
-        file_targets+=( "$arg" )
-        
-      elif [[ -d "$arg" ]]; then
-        dirname_base=$(basename "$arg")
-        if is_dir_ignored "$arg"; then
-          print_dir_ignore_msg "$dirname_base" "warning"
-        fi
-        dir_targets+=( "$arg" )
-      fi
-      
+    if [[ "$PLATFORM" == "macos" ]]; then
+      total_bytes=$(tr '\n' '\0' < "$list_file" \
+        | xargs -0 stat -f %z 2>/dev/null \
+        | awk '{s+=$1} END {print s+0}')
     else
-      # Path doesn't exist - use chained resolution
-      if ! resolved_dir=$(resolve_chained_path "$dir_path"); then
-        exit 1
-      fi
-      
-      full_path="$resolved_dir/$filename"
-      
-      if [[ -d "$full_path" ]]; then
-        if is_dir_ignored "$full_path"; then
-          resolved_name=$(basename "$full_path")
-          print_dir_ignore_msg "$resolved_name" "error"
-          exit 1
-        fi
-        dir_targets+=( "$full_path" )
-        
-      elif [[ -f "$full_path" ]]; then
-        # Check if parent directory is ignored (using recursive check)
-        check_parent_ignores "$full_path"
-        
-        if ! is_text_file "$full_path"; then
-          printf "%s\n" "${CLR_ERROR}Error: File '$filename' is a binary file and cannot be copied.${RESET}" >&2
-          exit 1
-        fi
-        if check_file_ignore "$filename"; then
-          printf "%s\n" "${CLR_ERROR}Error: File '$filename' is ignored by pattern.${RESET}" >&2
-          printf "${DIM}Use --no-ignore to include it anyway.${RESET}\n" >&2
-          exit 1
-        fi
-        file_targets+=( "$full_path" )
-        
-      else
-        printf "%s\n" "${CLR_ERROR}Error: '$filename' not found in directory '$resolved_dir'${RESET}" >&2
-        printf "${DIM}Searched in: $full_path${RESET}\n" >&2
-        exit 1
-      fi
+      total_bytes=$(tr '\n' '\0' < "$list_file" \
+        | xargs -0 stat -c %s 2>/dev/null \
+        | awk '{s+=$1} END {print s+0}')
     fi
   fi
-done
-
-if (( ${#file_targets[@]} == 0 && ${#dir_targets[@]} == 0 )); then
-  printf "%s\n" "${CLR_ERROR}Error: No valid targets specified.${RESET}" >&2
-  exit 1
-fi
-
-# 11) BUILD FALLBACK COMMANDS
-find_opts=()
-if [[ "$NO_IGNORE" == false ]] && (( ${#ignore_dirs[@]} > 0 )); then
-  for d in "${ignore_dirs[@]}"; do find_opts+=( -name "$d" -prune -o ); done
-fi
-find_opts+=( -type f )
-find_opts+=( -print0 )
-
-# 12) PHASE 1: DISCOVERY
-LISTFILE="$(mktemp)"
-count=0
-
-printf "\n${BOLD}Discovering files...${RESET}\n\n" >&2
-
-# PHASE 1A: Process individual files
-if (( ${#file_targets[@]} > 0 )); then
-  for f in "${file_targets[@]}"; do
-    if [[ ! -r "$f" ]]; then
-      printf "${CLR_WARN}Warning: Cannot read file '%s'. Skipping.${RESET}\n" "$f" >&2
-      continue
-    fi
-    if is_text_file "$f"; then
-      normalized="${f#./}"
-      echo "$normalized" >> "$LISTFILE"
-      ((++count))
-      if (( count % 100 == 0 )); then
-      printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "$normalized" >&2
-      fi
-    fi
-  done
-fi
-
-# PHASE 1B: Process directories
-if [[ "$IS_GIT" == true && "$NO_IGNORE" == false ]] && (( ${#dir_targets[@]} > 0 )); then
-  # GIT MODE
-  # GIT MODE
-  for tgt in "${dir_targets[@]}"; do
-    # Check if this target belongs to a DIFFERENT git root (nested repo)
-    # We resolve the absolute path to be sure
-    abs_tgt=$(cd "$tgt" && pwd -P)
-    tgt_git_root=$(git -C "$abs_tgt" rev-parse --show-toplevel 2>/dev/null || echo "")
-    
-    # Calculate relation to current root
-    current_git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-    
-    # Defaults for standard intra-repo behavior
-    git_cmd=(git ls-files --cached --others --exclude-standard "$tgt")
-    is_nested=false
-    
-    if [[ -n "$tgt_git_root" && "$tgt_git_root" != "$current_git_root" ]]; then
-      # NESTED REPO DETECTED
-      is_nested=true
-      
-      # Run ls-files INSIDE the nested repo.
-      # git -C "$tgt" ls-files lists files relative to "$tgt".
-      # We will prefix "$tgt/" to each line in the loop below to make it relative to CWD.
-      git_cmd=(git -C "$tgt" ls-files --cached --others --exclude-standard)
-    fi
-
-    while IFS= read -r line; do
-       if [[ "$is_nested" == true ]]; then
-         # Prefix with the target directory to make it relative to CWD
-         # Ensure clean path joining
-         f="${tgt%/}/$line"
-       else
-         f="$line"
-       fi
-       
-       filename="${f##*/}"
-       skip=false
-       if (( ${#ignore_files[@]} > 0 )); then
-         for pat in "${ignore_files[@]}"; do
-           if [[ "$filename" == $pat ]]; then skip=true; break; fi
-         done
-       fi
-       
-       if [[ "$skip" == false && "$NO_IGNORE" == false ]] && (( ${#ignore_dirs[@]} > 0 )); then
-         # Calculate path relative to the target directory
-         # This ensures that if we explicitly targeted an ignored directory (e.g. 'dist'),
-         # we don't immediately filter out its contents.
-         
-         clean_tgt="${tgt#./}"
-         clean_tgt="${clean_tgt%/}"
-         rel_path="$f"
-         
-         if [[ "$clean_tgt" != "." && "$f" == "$clean_tgt/"* ]]; then
-           rel_path="${f#$clean_tgt/}"
-         fi
-
-         for d in "${ignore_dirs[@]}"; do
-           # Check if the relative path contains the ignored directory
-           if [[ "$rel_path" == *"/$d/"* || "$rel_path" == "$d/"* ]]; then
-             skip=true
-             break
-           fi
-         done
-       fi
-       
-       [[ "$skip" == true ]] && continue
-
-       [[ -f "$f" ]] || continue
-       if [[ ! -r "$f" ]]; then
-         printf "${CLR_WARN}Warning: Cannot read file '%s'. Skipping.${RESET}\n" "$f" >&2
-         continue
-       fi
-       
-       if is_text_file "$f"; then
-         echo "$f" >> "$LISTFILE"
-         ((++count))
-                   if (( count % 100 == 0 )); then
-           printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "$f" >&2
-         fi
-       fi
-    done < <("${git_cmd[@]}")
-  done
-elif (( ${#dir_targets[@]} > 0 )); then
-  # FALLBACK MODE (FIND)
-  for tgt in "${dir_targets[@]}"; do
-    if (( ${#find_opts[@]} > 0 )); then
-      while IFS= read -r -d '' f; do
-        if [[ "$NO_IGNORE" == false ]] && (( ${#ignore_files[@]} > 0 )); then
-          filename="${f##*/}"
-          skip=false
-          for pat in "${ignore_files[@]}"; do
-             if [[ "$filename" == $pat ]]; then skip=true; break; fi
-          done
-          [[ "$skip" == true ]] && continue
-    fi
-
-        if [[ ! -r "$f" ]]; then
-          printf "${CLR_WARN}Warning: Cannot read file '%s'. Skipping.${RESET}\n" "$f" >&2
-          continue
-        fi
-        if is_text_file "$f"; then
-          echo "${f#./}" >> "$LISTFILE"
-          ((++count))
-          if (( count % 100 == 0 )); then
-            printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "${f#./}" >&2
-          fi
-        fi
-      done < <(find "$tgt" "${find_opts[@]}")
-    else
-      while IFS= read -r -d '' f; do
-        if [[ "$NO_IGNORE" == false ]] && (( ${#ignore_files[@]} > 0 )); then
-          filename="${f##*/}"
-          skip=false
-          for pat in "${ignore_files[@]}"; do
-             if [[ "$filename" == $pat ]]; then skip=true; break; fi
-          done
-          [[ "$skip" == true ]] && continue
-        fi
-        
-        if [[ ! -r "$f" ]]; then
-          printf "${CLR_WARN}Warning: Cannot read file '%s'. Skipping.${RESET}\n" "$f" >&2
-          continue
-        fi
-        if is_text_file "$f"; then
-          echo "${f#./}" >> "$LISTFILE"
-          ((++count))
-          if (( count % 100 == 0 )); then
-            printf "${CLR_LABEL}[%d]${RESET} ${DIM}%s${RESET}\n" "$count" "${f#./}" >&2
-          fi
-        fi
-      done < <(find "$tgt" -type f -print0)
-    fi
-  done
-fi
-
-if [[ ! -s "$LISTFILE" ]]; then
-  printf "%s\n" "${CLR_WARN}No text files found.${RESET}" >&2
-  exit 1
-fi
-
-# 13) PHASE 2: PREVIEW & ANALYSIS
-total_bytes=0
-if [[ -s "$LISTFILE" ]]; then
-  # Batch stat for speed; fall back to per-file if needed.
-  if [[ "$OS_TYPE" == "macos" ]]; then
-    total_bytes=$(tr '\n' '\0' < "$LISTFILE" \
-      | xargs -0 stat -f %z 2>/dev/null \
-      | awk '{s+=$1} END {print s+0}' || echo 0)
-  else
-    total_bytes=$(tr '\n' '\0' < "$LISTFILE" \
-      | xargs -0 stat -c %s 2>/dev/null \
-      | awk '{s+=$1} END {print s+0}' || echo 0)
-  fi
-
   if [[ ! "$total_bytes" =~ ^[0-9]+$ ]]; then
     total_bytes=0
-  while IFS= read -r f; do
-    size=$(get_file_size "./$f")
-    [[ "$size" =~ ^[0-9]+$ ]] || size=0
-    total_bytes=$((total_bytes + size))
-  done < "$LISTFILE"
+    local s
+    while IFS= read -r f; do
+      s=$(get_file_size "./$f")
+      [[ "$s" =~ ^[0-9]+$ ]] || s=0
+      total_bytes=$((total_bytes + s))
+    done < "$list_file"
   fi
-fi
 
-total_bytes=$((total_bytes + (count * 30)))
-human_size=$(format_size "$total_bytes")
+  local size_tokens human_size est_tokens
+  size_tokens=$(format_size_and_tokens "$total_bytes" "$total_files")
+  human_size="${size_tokens% *}"
+  est_tokens="${size_tokens##* }"
+  timer_end "$t_size" "Size calculation"
 
-est_tokens=$((total_bytes / 4))
-TOKEN_WARN_LIMIT=32000
+  local TOKEN_WARN=100000
+  local short_config
+  short_config=$(short_path "$GLOBAL_HISS")
 
-printf "\n${BOLD}Files to Copy:${RESET}\n" >&2
-
-if [[ "$NO_IGNORE" == true ]]; then
-  printf "  ${CLR_WARN}⚠️  Filters DISABLED (--no-ignore)${RESET}\n" >&2
-elif [[ "$IS_GIT" == true && "$HAS_GITIGNORE" == true ]]; then
-  printf "  ${CLR_GIT}Excluding files matched by .gitignore (git repo) and %s${RESET}\n" "$CONFIG" >&2
-elif [[ "$IS_GIT" == true && "$HAS_GITIGNORE" == false ]]; then
-  printf "  ${CLR_WARN}Git repo detected but no .gitignore found; only %s applies.${RESET}\n" "$CONFIG" >&2
-elif [[ "$HAS_GIT" == false ]]; then
-  printf "  ${CLR_WARN}git not installed; only %s applies (no .gitignore support).${RESET}\n" "$CONFIG" >&2
-else
-  printf "  ${CLR_WARN}Not a git repo; only %s applies (standalone .gitignore files are ignored).${RESET}\n" "$CONFIG" >&2
-fi
-
-if [[ "$NO_TREE" == false ]]; then
-print_tree "$LISTFILE" >&2
-fi
-printf "\n" >&2
-
-if (( est_tokens > TOKEN_WARN_LIMIT )); then
-  printf "  ${CLR_WARN}⚠️  Warning: ~%d tokens. This may exceed the context window of some LLMs.%s\n" "$est_tokens" "${RESET}" >&2
-fi
-
-printf "  ${CLR_LABEL}%-8s${RESET} ${CLR_VALUE}%d files${RESET}\n" "Count:" "$count" >&2
-printf "  ${CLR_LABEL}%-8s${RESET} ${CLR_VALUE}%s${RESET}\n" "Size:" "$human_size" >&2
-printf "  ${CLR_LABEL}%-8s${RESET} ${CLR_VALUE}~%d${RESET}\n" "Tokens:" "$est_tokens" >&2
-
-# 14) AUTO-CONFIRMATION LOGIC
-if [[ "$SKIP_CONFIRM" == false && $est_tokens -gt $TOKEN_WARN_LIMIT ]]; then
-  prompt_yn "${CLR_PROMPT}Proceed with copy? [y/N] ${RESET}" "n"
-  if [[ "$PROMPT_RESPONSE" != "y" ]]; then
-    printf "${CLR_WARN}Aborted.${RESET}\n" >&2
-    exit 0
-  fi
-fi
-
-# 14.5) CLIPBOARD DETECTION (late)
-CLIPBOARD_CMD=""
-USE_CLIPBOARD=true
-if ! CLIPBOARD_CMD="$(detect_clipboard_cmd)"; then
-  if [[ "$PRINT_CONTENT" == true ]]; then
-    USE_CLIPBOARD=false
-    printf "${CLR_WARN}Warning: No clipboard tool found. Printing to stdout only.${RESET}\n" >&2
+  # ── Phase 3: Preview ──
+  if [[ "$any_no_ignore" == true ]]; then
+    info "  ${C_WARN}Safety filters disabled (+\"*\")${RESET}\n"
+  elif [[ "$IS_GIT" == true && "$HAS_GITIGNORE" == true ]]; then
+    info "  ${C_GIT}Filtered by .gitignore + %s${RESET}\n" "$short_config"
+  elif [[ "$IS_GIT" == true ]]; then
+    info "  ${C_WARN}Git repo, but no .gitignore; only %s applies.${RESET}\n" "$short_config"
+  elif [[ "$HAS_GIT" == false ]]; then
+    info "  ${C_WARN}git not installed; only %s applies.${RESET}\n" "$short_config"
   else
-    echo "Error: No clipboard tool found." >&2
-    case "$OS_TYPE" in
-      macos) echo "  Install Xcode command line tools or ensure pbcopy is in PATH." >&2 ;;
-      wsl)   echo "  Ensure clip.exe is available, or install xclip." >&2 ;;
-      linux)
-             # Detect display server to recommend the right tool
-             if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-               echo "  Wayland detected. Install wl-clipboard:" >&2
-               echo "    Ubuntu/Debian: sudo apt install wl-clipboard" >&2
-               echo "    Fedora/RHEL:   sudo dnf install wl-clipboard" >&2
-               echo "    Arch:          sudo pacman -S wl-clipboard" >&2
-             else
-               echo "  X11 detected. Install xclip:" >&2
-               echo "    Ubuntu/Debian: sudo apt install xclip" >&2
-               echo "    Fedora/RHEL:   sudo dnf install xclip" >&2
-               echo "    Arch:          sudo pacman -S xclip" >&2
-             fi ;;
-    esac
-    exit 1
+    info "  ${C_WARN}Not a git repo; only %s applies.${RESET}\n" "$short_config"
   fi
-fi
 
-# 15) PHASE 3: EXECUTION
-TMPFILE="$(mktemp)"
+  local git_status_file=""
+  if [[ "$no_tree" == false && "$IS_GIT" == true ]]; then
+    git_status_file=$(mktmp)
+    # Generate git status map (path\tstatus_letter) — single awk pass.
+    git status --porcelain 2>/dev/null | awk '{
+      xy = substr($0, 1, 2)
+      path = substr($0, 4)
+      sub(/\/$/, "", path)
+      if (xy == "??")                                   print path "\t?"
+      else if (substr(xy,1,1) == "A")                   print path "\tA"
+      else if (substr(xy,1,1) != " " && substr(xy,1,1) != "?") print path "\tS"
+      else if (substr(xy,2,1) == "M" || substr(xy,2,1) == "D") print path "\tM"
+    }' > "$git_status_file"
+  fi
 
-awk -v warn="$CLR_WARN" -v reset="$RESET" '
+  local file_word
+  file_word=$(plural "$total_files")
+  if [[ "$preview" == true ]]; then
+    # --preview: enriched tree (sizes already collected in Phase 2) + git status.
+    if [[ "$no_tree" == false ]]; then
+      print_tree "$list_file" "$sizes_file" "$git_status_file"
+    fi
+    printf "\n  ${C_LABEL}%-8s${RESET} ${C_VALUE}%d %s${RESET}\n" "Count:" "$total_files" "$file_word"
+    printf "  ${C_LABEL}%-8s${RESET} ${C_VALUE}%s${RESET}\n" "Size:" "$human_size"
+    printf "  ${C_LABEL}%-8s${RESET} ${C_VALUE}~%d${RESET}\n" "Tokens:" "$est_tokens"
+    exit 0
+  else
+    if [[ "$no_tree" == false && "$QUIET" != true ]]; then
+      print_tree "$list_file" "$sizes_file" "$git_status_file" >&2
+    fi
+    info "\n  ${C_LABEL}%-8s${RESET} ${C_VALUE}%d %s${RESET}\n" "Count:" "$total_files" "$file_word"
+    info "  ${C_LABEL}%-8s${RESET} ${C_VALUE}%s${RESET}\n" "Size:" "$human_size"
+    info "  ${C_LABEL}%-8s${RESET} ${C_VALUE}~%d${RESET}\n" "Tokens:" "$est_tokens"
+  fi
+
+  if (( est_tokens > TOKEN_WARN )); then
+    info "  ${C_WARN}~%d tokens may exceed some LLM context windows.${RESET}\n" "$est_tokens"
+  fi
+
+  # ── Confirmation ──
+  if [[ "$skip_confirm" == false && "$QUIET" != true ]] && (( est_tokens > TOKEN_WARN )); then
+    if ! prompt_yn "${C_PROMPT}Proceed? [y/N]${RESET}" "n"; then
+      printf "${C_WARN}Aborted.${RESET}\n" >&2
+      exit 0
+    fi
+  fi
+
+  # ── Phase 4: Build output ──
+  local t_build
+  t_build=$(timer_start)
+  local output_file
+  output_file=$(mktmp)
+
+  awk -v warn="$C_WARN" -v rst="$RESET" '
   {
     f = "./" $0
     r = (getline line < f)
     if (r < 0) {
-      printf "%sWarning: Cannot read file '\''%s'\''. Skipping.%s\n", warn, f, reset > "/dev/stderr"
+      printf "%sWarning: Cannot read %s. Skipping.%s\n", warn, f, rst > "/dev/stderr"
       next
     }
-    print "# File: " $0
+    print "<file path=\"" $0 "\">"
     if (r > 0) {
       print line
       while ((getline line < f) > 0) print line
     }
     close(f)
-    print ""
-  }
-' "$LISTFILE" > "$TMPFILE"
+    print "</file>\n"
+  }' "$list_file" > "$output_file"
+  timer_end "$t_build" "Build output"
 
-# Use eval to handle multi-word clipboard commands (e.g., "xclip -selection clipboard")
-# This is safe because CLIPBOARD_CMD is set internally, not from user input
-if [[ "$USE_CLIPBOARD" == true ]]; then
-  clipboard_ok=true
-  if ! eval "$CLIPBOARD_CMD" < "$TMPFILE" 2>/dev/null; then
-    if [[ "$PRINT_CONTENT" == true ]]; then
-      clipboard_ok=false
-      printf "\n${CLR_WARN}⚠ Clipboard copy failed; continuing with --print output.${RESET}\n" >&2
-      printf "${DIM}The clipboard tool '${CLIPBOARD_CMD%% *}' could not copy the content.${RESET}\n" >&2
+  # ── Phase 5: Output ──
+  local t_clip
+  t_clip=$(timer_start)
+
+  # Extract first and last file for the success message.
+  local first_file last_file
+  first_file=$(head -1 "$list_file")
+  last_file=$(tail -1 "$list_file")
+
+  if [[ "$print_content" == true ]]; then
+    # --print: write to stdout instead of clipboard.
+    cat "$output_file"
+  else
+    # Default: copy to clipboard.
+    if ! detect_clipboard_cmd; then
+      printf "${C_ERR}Error: No clipboard tool found.${RESET}\n" >&2
+      print_clipboard_install_hint
+      printf "\n${DIM}Or use --print to output to stdout:${RESET}\n" >&2
+      printf "  catclip --print src > output.txt\n" >&2
+      exit 1
+    fi
+
+    if "${CLIPBOARD_CMD[@]}" < "$output_file" 2>/dev/null; then
+      if (( total_files == 1 )); then
+        info "\n${C_OK}Copied${RESET} ${BOLD}%s${RESET} ${C_OK}to clipboard${RESET}\n" "$first_file"
+      elif [[ "$first_file" == "$last_file" ]]; then
+        info "\n${C_OK}Copied${RESET} ${BOLD}%d %s${RESET} ${C_OK}to clipboard${RESET}\n" "$total_files" "$file_word"
+      else
+        info "\n${C_OK}Copied${RESET} ${BOLD}%d %s${RESET} ${C_OK}to clipboard${RESET} ${DIM}(%s ... %s)${RESET}\n" \
+          "$total_files" "$file_word" "$first_file" "$last_file"
+      fi
     else
-      printf "\n${CLR_ERROR}✗ Clipboard copy failed!${RESET}\n" >&2
-      printf "${DIM}The clipboard tool '${CLIPBOARD_CMD%% *}' could not copy the content.${RESET}\n" >&2
-      
-      # Provide platform-specific guidance
-      case "$OS_TYPE" in
-        linux)
-          if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-            printf "${CLR_WARN}You appear to be on Wayland. Install wl-clipboard:${RESET}\n" >&2
-            printf "  sudo apt install wl-clipboard  ${DIM}# Ubuntu/Debian${RESET}\n" >&2
-          else
-            printf "${CLR_WARN}Try installing xclip:${RESET}\n" >&2
-            printf "  sudo apt install xclip  ${DIM}# Ubuntu/Debian${RESET}\n" >&2
-          fi
-          ;;
-      esac
-      
-      printf "\n${DIM}Alternatively, use --print to output to terminal:${RESET}\n" >&2
-      printf "  catclip --print > output.txt\n" >&2
+      printf "\n${C_ERR}Clipboard copy failed.${RESET}\n" >&2
+      print_clipboard_install_hint
+      printf "\n${DIM}Use --print to output to stdout:${RESET}\n" >&2
+      printf "  catclip --print src > output.txt\n" >&2
       exit 1
     fi
   fi
-  if [[ "$clipboard_ok" == true ]]; then
-    printf "\n${CLR_SUCCESS}✔${RESET} ${BOLD}Copied to clipboard!${RESET}\n" >&2
-  fi
-fi
+  timer_end "$t_clip" "Output"
 
-if [[ "$PRINT_CONTENT" == true ]]; then
-  cat "$TMPFILE"
-fi
+  vlog "Total: ${SECONDS}s"
+}
+
+# [Point 9] Scope accumulator as globals — close_scope() mutates these.
+# Declared here so they're visible to both main() and close_scope().
+_cur_targets=()
+_cur_changed=false
+_cur_no_ignore=false
+_cur_only=()
+_cur_skip=()
+_cur_force=()
+_cur_contains=""
+
+main "$@"
