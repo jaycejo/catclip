@@ -14,7 +14,7 @@ catclip src  # That's it.
 - 🧩 **Multiple targets** - `catclip README.md src docs` in one run
 - 🧾 **File headers in output** - each file is wrapped in `<file path="path/to/file">` tags
 - 🌳 **Visual preview** - Tree view with file count, size, and token estimate before copying
-- 🙈 **Git-aware** - Respects `.gitignore` and supports diff-only context with `--changed`
+- 🙈 **Git-aware** - Respects `.gitignore`, filters by staged/unstaged/untracked, and can output diffs instead of full files
 - 🎛️ **Flexible ignores** - `--exclude "*.css"` to skip, `--include "tests/"` to restore, `--include "*"` to disable all rules
 - 🛡️ **Secret protection** - Blocks `.env`, keys, credentials
 
@@ -130,16 +130,56 @@ catclip src --preview
 
 # Skip files (this run only):
 catclip src --exclude "LoginForm.tsx"
+
+# Only files containing a pattern (regex):
+catclip src --contains "TODO"
+
+# Only blocks around TODO matches (not full files):
+catclip src --contains "TODO" --snippet
+
+# Staged changes as unified diff (great for commit review):
+catclip --staged --diff
+
+# All changes as patches + architecture reference:
+catclip --changed --diff --then src/api/reference.ts
 ```
 
 </details>
 
-## Changed files (Git only)
+## Git-Aware Context
+
+### Changed files
+```bash
+catclip --changed              # All modified: staged + unstaged + untracked
+catclip src --changed          # Scoped to src/
 ```
-catclip --changed
-catclip src --changed
+
+### Composable git filters
+Use specific filters instead of `--changed` to narrow what you grab:
+```bash
+catclip --staged               # Files in the git index (staged for commit)
+catclip --unstaged             # Tracked files with uncommitted modifications
+catclip --untracked            # New files not yet tracked by git
+catclip --staged --untracked   # Combine: staged + new, skip WIP edits
 ```
-Copies only the files that differ from `HEAD`, including staged changes and untracked files. Runs only inside a Git repository. Optional targets limit the scope (for example, `src` only).
+`--changed` is shorthand for all three. Each flag implies `--changed` automatically.
+
+### Diff output
+Replace full file content with unified git patches:
+```bash
+catclip --changed --diff       # All modified files as patches
+catclip --staged --diff        # Staged changes only — ideal for commit review
+catclip --unstaged --diff      # WIP edits — what you're actively changing
+```
+Untracked files have no diff and are included with their full content.
+The tree preview shows `[diff only]` or `[snippet only]` on files with partial output.
+
+### Snippet extraction
+With `--contains`, extract only the blank-line-bounded blocks around each match instead of the full file:
+```bash
+catclip src --contains "TODO" --snippet        # Blocks around each TODO
+catclip . --contains "useState" --snippet      # React hook call-sites only
+```
 
 ## Scopes
 Use `--then` to apply different modifiers to different targets:
@@ -197,7 +237,13 @@ catclip src --include "tests/" --exclude "*.snap"  # combine both
 | `-t`, `--no-tree` | Skip tree rendering |
 | `--hiss-reset` | Restore default ignore config |
 | `--only GLOB` | Include only files matching shell glob (OR across repeats) |
-| `--changed` | Copy files changed since the last commit (requires Git repo; optional targets scope results). |
+| `--changed` | All modified files: staged + unstaged + untracked (requires Git) |
+| `--staged` | Only staged files (git index) |
+| `--unstaged` | Only unstaged tracked modifications |
+| `--untracked` | Only new untracked files |
+| `--diff` | Emit unified diff instead of full file (requires a change-selection flag) |
+| `--contains PATTERN` | Only files whose contents match regex pattern |
+| `--snippet` | With `--contains`: emit only matched blocks (blank-line bounded) |
 | `--then` | Start a new scope (separate targets with different modifiers) |
 | `--preview` | Show file tree and token count without copying |
 
