@@ -26,40 +26,57 @@ catclip src  # That's it.
 ```bash
 brew tap tigreau/catclip && brew install catclip
 ```
-Note: Homebrew installs the CLI only. The example project is available when you clone the repo.
+Note: Homebrew installs the CLI only.
 
-### From Source (Git)
+### Direct install script (macOS / Linux)
 ```bash
-git clone https://github.com/tigreau/catclip.git
-cd catclip && ./install.sh
+curl -fsSL https://raw.githubusercontent.com/tigreau/catclip/main/install.sh | bash
 ```
 
-**Requirements**: Bash 3.2+, clipboard tool (auto-detected)
+If `curl` is not available:
+```bash
+wget -qO- https://raw.githubusercontent.com/tigreau/catclip/main/install.sh | bash
+```
+
+This installer downloads the latest prebuilt release binary. It does not require Go.
+
+**Requirements**: Clipboard tool (auto-detected)
 - macOS: Built-in ✓
 - Linux: `xclip` or `wl-clipboard`
-- WSL: Built-in ✓
 
-<details><summary>Manual install (no script)</summary>
+<details><summary>Manual install (Linux binary, no script)</summary>
+
+Download the release archive that matches your architecture:
+
+- `catclip_linux_amd64.tar.gz` for `x86_64`
+- `catclip_linux_arm64.tar.gz` for `aarch64` / `arm64`
 
 ```bash
-PREFIX="${PREFIX:-/usr/local}"
+PREFIX="${PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
 SHARE_DIR="$PREFIX/share/catclip"
 
 mkdir -p "$BIN_DIR" "$SHARE_DIR"
-cp catclip "$BIN_DIR/"
-cp VERSION "$SHARE_DIR/VERSION"
+tar -xzf catclip_linux_amd64.tar.gz
+install -m 755 catclip "$BIN_DIR/catclip"
+install -m 644 VERSION "$SHARE_DIR/VERSION"
 ```
 
-If you prefer a user-local install (no sudo):
-```bash
-PREFIX="$HOME/.local"
-mkdir -p "$PREFIX/bin" "$PREFIX/share/catclip"
-cp catclip "$PREFIX/bin/"
-cp VERSION "$PREFIX/share/catclip/VERSION"
-```
+If `~/.local/bin` is not already on `PATH`, add it in your shell profile.
 
 The global config (`~/.config/catclip/.hiss`) is created automatically on first run.
+</details>
+
+<details><summary>Build from source</summary>
+
+```bash
+git clone https://github.com/tigreau/catclip.git
+cd catclip
+./install.sh
+```
+
+When run from a cloned checkout, `./install.sh` builds the checked-out source instead of downloading a release binary.
+Go is only required for this source-install path.
 </details>
 
 <details><summary>Updating & Uninstalling</summary>
@@ -70,18 +87,18 @@ Use the section that matches how you installed catclip.
 brew upgrade catclip
 brew uninstall catclip
 
-# From Source (Git)
-git pull && ./install.sh
+# Direct script / local install
 ./uninstall.sh
+
+# Manual binary install
+rm -f "$HOME/.local/bin/catclip" "$HOME/.local/share/catclip/VERSION"
 ```
 </details>
 
 ---
 
 ## Try It
-The repository includes a `dummy-react-project` to experiment with (clone the repo to access it):
 ```bash
-cd dummy-react-project
 catclip components          # Copy directory
 catclip layout/Sidebar.tsx  # Copy file
 ```
@@ -89,8 +106,6 @@ catclip layout/Sidebar.tsx  # Copy file
 You don't even have to type the full directory name, `com` is enough:
 
 <img width="1300" height="835" alt="image" src="https://github.com/user-attachments/assets/c2d2fb10-310a-4cd6-aa6d-d5bea0fbf2d0" />
-
-
 
 ---
 
@@ -284,7 +299,7 @@ Remove permanently: `catclip --hiss` (delete the line from the config)
 
 ## Contributing
 
-PRs welcome! Keep changes POSIX-compatible and test on macOS.
+PRs welcome! Keep changes portable across macOS and Linux, and preserve CLI/output parity.
 
 1. Fork & clone
 2. Create branch: `git checkout -b feature/name`

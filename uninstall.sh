@@ -1,79 +1,92 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ------------------------------------------------------------------------------
-# uninstall.sh — Uninstall catclip
-# ------------------------------------------------------------------------------
+# uninstall.sh removes the installed catclip binary and version metadata from
+# the standalone Go project layout. Config removal stays opt-in.
 
-# Colors
-RESET=$'\033[0m'
-BOLD=$'\033[1m'
-RED=$'\033[31m'
-GREEN=$'\033[32m'
-YELLOW=$'\033[33m'
-CYAN=$'\033[36m'
-
-# Paths
 PREFIX="${PREFIX:-/usr/local}"
 BIN_DIR="$PREFIX/bin"
-TARGET="$BIN_DIR/catclip"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/catclip"
 SHARE_DIR="$PREFIX/share/catclip"
+TARGET="$BIN_DIR/catclip"
 VERSION_FILE="$SHARE_DIR/VERSION"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/catclip"
 
-echo "${BOLD}Uninstalling catclip...${RESET}"
-echo
-
-# 1. Remove Binary
-if [[ -f "$TARGET" ]]; then
-  echo "Removing binary: ${CYAN}$TARGET${RESET}"
-  
-  if [[ -w "$BIN_DIR" ]]; then
-    rm "$TARGET"
-    echo "${GREEN}✔ Binary removed.${RESET}"
-  else
-    echo "${YELLOW}Permission denied. Trying with sudo...${RESET}"
-    if sudo rm "$TARGET"; then
-        echo "${GREEN}✔ Binary removed.${RESET}"
-    else
-        echo "${RED}❌ Failed to remove binary.${RESET}"
-        exit 1
-    fi
-  fi
+if [[ -t 1 && "${TERM:-}" != "dumb" ]]; then
+  RESET=$'\033[0m'
+  BOLD=$'\033[1m'
+  GREEN=$'\033[32m'
+  CYAN=$'\033[36m'
+  YELLOW=$'\033[33m'
+  RED=$'\033[31m'
 else
-  echo "${YELLOW}Binary not found at $TARGET. Skipping.${RESET}"
+  RESET=''
+  BOLD=''
+  GREEN=''
+  CYAN=''
+  YELLOW=''
+  RED=''
 fi
 
-# 2. Remove Config (Optional)
-if [[ -d "$CONFIG_DIR" ]]; then
-  echo
-  echo "Configuration directory found at: ${CYAN}$CONFIG_DIR${RESET}"
-  read -r -p "Do you want to remove the configuration files? [Y/n] " remove_config
-  if [[ ! "$remove_config" =~ ^[Nn]$ ]]; then
+die() {
+  printf '%sError:%s %s\n' "$RED" "$RESET" "$*" >&2
+  exit 1
+}
+
+homebrew_manages_catclip() {
+  if ! command -v brew >/dev/null 2>&1; then
+    return 1
+  fi
+
+  brew list --versions catclip >/dev/null 2>&1 && return 0
+  brew list --cask --versions catclip >/dev/null 2>&1 && return 0
+  return 1
+}
+
+remove_path() {
+  local path="$1"
+  if [[ ! -e "$path" ]]; then
+    return 0
+  fi
+
+  if [[ -w "$(dirname "$path")" ]]; then
+    rm -f "$path"
+    return 0
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    sudo rm -f "$path"
+    return 0
+  fi
+
+  printf '%sError:%s cannot remove %s without sudo\n' "$RED" "$RESET" "$path" >&2
+  exit 1
+}
+
+printf '%sUninstalling catclip...%s\n' "$BOLD" "$RESET"
+
+if homebrew_manages_catclip; then
+  die "catclip appears to be managed by Homebrew; use 'brew uninstall catclip' instead."
+fi
+
+if [[ -e "$TARGET" ]]; then
+  printf 'Removing %s%s%s\n' "$CYAN" "$TARGET" "$RESET"
+  remove_path "$TARGET"
+else
+  printf '%sNotice:%s %s not found\n' "$YELLOW" "$RESET" "$TARGET"
+fi
+
+if [[ -e "$VERSION_FILE" ]]; then
+  printf 'Removing %s%s%s\n' "$CYAN" "$VERSION_FILE" "$RESET"
+  remove_path "$VERSION_FILE"
+fi
+
+if [[ -d "$CONFIG_DIR" && -t 0 ]]; then
+  printf 'Remove config at %s%s%s? [y/N] ' "$CYAN" "$CONFIG_DIR" "$RESET"
+  read -r reply
+  if [[ "$reply" =~ ^[Yy]$ ]]; then
     rm -rf "$CONFIG_DIR"
-    echo "${GREEN}✔ Configuration removed.${RESET}"
-  else
-    echo "Configuration preserved."
+    printf '%sRemoved config.%s\n' "$GREEN" "$RESET"
   fi
 fi
 
-# 3. Remove Shared Version File
-if [[ -f "$VERSION_FILE" ]]; then
-  echo
-  echo "Removing version file: ${CYAN}$VERSION_FILE${RESET}"
-  if [[ -w "$SHARE_DIR" ]]; then
-    rm "$VERSION_FILE"
-    echo "${GREEN}✔ Version file removed.${RESET}"
-  else
-    echo "${YELLOW}Permission denied. Trying with sudo...${RESET}"
-    if sudo rm "$VERSION_FILE"; then
-      echo "${GREEN}✔ Version file removed.${RESET}"
-    else
-      echo "${RED}❌ Failed to remove version file.${RESET}"
-      exit 1
-    fi
-  fi
-fi
-
-echo
-echo "${GREEN}${BOLD}Uninstallation complete.${RESET}"
+printf '%sDone.%s\n' "$GREEN" "$RESET"
