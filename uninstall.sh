@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# uninstall.sh removes the installed catclip binary and version metadata from
-# the standalone Go project layout. Config removal stays opt-in.
+# uninstall.sh removes the standalone catclip install, including its private
+# bundled rg/fzf binaries under share/catclip/bin. Config removal stays opt-in.
 
 PREFIX="${PREFIX:-/usr/local}"
 BIN_DIR="$PREFIX/bin"
 SHARE_DIR="$PREFIX/share/catclip"
+TOOLS_DIR="$SHARE_DIR/bin"
 TARGET="$BIN_DIR/catclip"
 VERSION_FILE="$SHARE_DIR/VERSION"
+RG_FILE="$TOOLS_DIR/rg"
+FZF_FILE="$TOOLS_DIR/fzf"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/catclip"
 
 if [[ -t 1 && "${TERM:-}" != "dumb" ]]; then
@@ -62,6 +65,22 @@ remove_path() {
   exit 1
 }
 
+remove_dir_if_empty() {
+  local path="$1"
+  if [[ ! -d "$path" ]]; then
+    return 0
+  fi
+
+  if [[ -w "$(dirname "$path")" ]]; then
+    rmdir "$path" 2>/dev/null || true
+    return 0
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    sudo rmdir "$path" 2>/dev/null || true
+  fi
+}
+
 printf '%sUninstalling catclip...%s\n' "$BOLD" "$RESET"
 
 if homebrew_manages_catclip; then
@@ -79,6 +98,16 @@ if [[ -e "$VERSION_FILE" ]]; then
   printf 'Removing %s%s%s\n' "$CYAN" "$VERSION_FILE" "$RESET"
   remove_path "$VERSION_FILE"
 fi
+
+for tool in "$RG_FILE" "$FZF_FILE"; do
+  if [[ -e "$tool" ]]; then
+    printf 'Removing %s%s%s\n' "$CYAN" "$tool" "$RESET"
+    remove_path "$tool"
+  fi
+done
+
+remove_dir_if_empty "$TOOLS_DIR"
+remove_dir_if_empty "$SHARE_DIR"
 
 if [[ -d "$CONFIG_DIR" && -t 0 ]]; then
   printf 'Remove config at %s%s%s? [y/N] ' "$CYAN" "$CONFIG_DIR" "$RESET"

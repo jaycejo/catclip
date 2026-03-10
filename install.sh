@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # install.sh prefers a local source build when run from a cloned checkout and
-# otherwise falls back to installing a prebuilt release binary. Homebrew
-# remains the primary path for package-managed installs.
+# otherwise falls back to installing a prebuilt release bundle. Packaged
+# installs always carry private rg/fzf binaries under share/catclip/bin; runtime
+# does not fall back to user PATH copies.
 
 PROGRAM_NAME="catclip"
 RELEASE_BASE_URL="${CATCLIP_RELEASE_BASE_URL:-https://github.com/tigreau/catclip/releases}"
@@ -11,6 +12,7 @@ INSTALL_VERSION="${CATCLIP_INSTALL_VERSION:-latest}"
 PREFIX="${PREFIX:-/usr/local}"
 BIN_DIR="$PREFIX/bin"
 SHARE_DIR="$PREFIX/share/catclip"
+TOOLS_DIR="$SHARE_DIR/bin"
 
 if [[ -t 1 && "${TERM:-}" != "dumb" ]]; then
   RESET=$'\033[0m'
@@ -44,6 +46,29 @@ need_cmd() {
 need_go_for_source_build() {
   command -v go >/dev/null 2>&1 && return 0
   die "Go is required when installing from a source checkout. Use Homebrew or the release installer if you do not want to build locally."
+}
+
+resolve_bundled_tool_source() {
+  local env_var="$1"
+  local tool_name="$2"
+  local override resolved
+
+  override="${!env_var:-}"
+  if [[ -n "$override" ]]; then
+    if [[ "$override" == *"/"* ]]; then
+      [[ -x "$override" ]] || die "$tool_name override at $override is not executable"
+      printf '%s\n' "$override"
+      return 0
+    fi
+    resolved="$(command -v "$override" || true)"
+    [[ -n "$resolved" ]] || die "$tool_name override '$override' not found"
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+
+  resolved="$(command -v "$tool_name" || true)"
+  [[ -n "$resolved" ]] || die "'$tool_name' is required because catclip packages a private bundled copy with every install"
+  printf '%s\n' "$resolved"
 }
 
 homebrew_manages_catclip() {
@@ -239,13 +264,17 @@ if SOURCE_DIR="$(find_local_source_dir)"; then
 
   VERSION_FILE="$SOURCE_DIR/VERSION"
   BINARY_FILE="$TMP_ROOT/$PROGRAM_NAME"
+  RG_FILE="$TMP_ROOT/rg"
+  FZF_FILE="$TMP_ROOT/fzf"
   VERSION="$(tr -d '\r' < "$VERSION_FILE" | head -n 1)"
   [[ -n "$VERSION" ]] || die "VERSION file is empty"
+  install -m 755 "$(resolve_bundled_tool_source CATCLIP_RG rg)" "$RG_FILE"
+  install -m 755 "$(resolve_bundled_tool_source CATCLIP_FZF fzf)" "$FZF_FILE"
 
   printf 'Building %s%s%s from source\n' "$CYAN" "$PROGRAM_NAME" "$RESET"
   (
     cd "$SOURCE_DIR"
-    go build -trimpath -o "$BINARY_FILE" .
+    go build -trimpath -o "$BINARY_FILE" ./cmd/catclip
   )
 else
   ARCHIVE_PATH="$TMP_ROOT/$ASSET_NAME"
@@ -268,8 +297,12 @@ else
 
   VERSION_FILE="$TMP_ROOT/VERSION"
   BINARY_FILE="$TMP_ROOT/$PROGRAM_NAME"
+  RG_FILE="$TMP_ROOT/bin/rg"
+  FZF_FILE="$TMP_ROOT/bin/fzf"
   [[ -f "$VERSION_FILE" ]] || die "release archive is missing VERSION"
   [[ -f "$BINARY_FILE" ]] || die "release archive is missing $PROGRAM_NAME"
+  [[ -f "$RG_FILE" ]] || die "release archive is missing bin/rg"
+  [[ -f "$FZF_FILE" ]] || die "release archive is missing bin/fzf"
 
   VERSION="$(tr -d '\r' < "$VERSION_FILE" | head -n 1)"
   [[ -n "$VERSION" ]] || die "VERSION file is empty"
@@ -277,10 +310,14 @@ fi
 
 install_file 755 "$BINARY_FILE" "$BIN_DIR/$PROGRAM_NAME"
 install_file 644 "$VERSION_FILE" "$SHARE_DIR/VERSION"
+install_file 755 "$RG_FILE" "$TOOLS_DIR/rg"
+install_file 755 "$FZF_FILE" "$TOOLS_DIR/fzf"
 
 printf '%sDone.%s\n' "$GREEN" "$RESET"
 printf '  Binary:  %s%s%s\n' "$CYAN" "$BIN_DIR/$PROGRAM_NAME" "$RESET"
 printf '  Version: %s%s%s\n' "$CYAN" "$VERSION" "$RESET"
+printf '  rg:      %s%s%s\n' "$CYAN" "$TOOLS_DIR/rg" "$RESET"
+printf '  fzf:     %s%s%s\n' "$CYAN" "$TOOLS_DIR/fzf" "$RESET"
 printf '  Config:  %s%s%s\n' "$CYAN" '~/.config/catclip/.hiss' "$RESET"
 
 if [[ "$BIN_DIR" == "$HOME/.local/bin" ]]; then
